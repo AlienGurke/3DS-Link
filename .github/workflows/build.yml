@@ -1,0 +1,52 @@
+name: 3DS-Link
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: 3dsx
+    runs-on: ubuntu-latest
+    container: devkitpro/devkitarm:latest
+    steps:
+    - name: Check out sources
+      uses: actions/checkout@v6
+    - name: Build
+      run: make
+    - uses: actions/upload-artifact@v7
+      with:
+        name: 3dsx-build
+        path: |
+          melonDS-Link.3dsx
+          melonDS-Link.elf
+
+  # makerom needs a newer glibc than the devkitPro container has
+  cia:
+    name: cia
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+    - name: Check out sources
+      uses: actions/checkout@v6
+    - uses: actions/download-artifact@v7
+      with:
+        name: 3dsx-build
+        path: .
+    - name: Cache makerom/bannertool
+      uses: actions/cache@v4
+      with:
+        path: cia/.tools
+        key: cia-tools-v1
+    - name: Build .cia (install with FBI for a Home Menu icon)
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: sh cia/build-cia.sh melonDS-Link.elf melonDS-Link.cia
+    - uses: actions/upload-artifact@v7
+      with:
+        name: melonDS-Link-3ds
+        path: |
+          melonDS-Link.cia
+          melonDS-Link.3dsx

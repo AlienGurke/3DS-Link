@@ -157,14 +157,20 @@ sind unter **3DS Link → Debug**.
 Wird gerade ein Spielstand geschrieben, fragt die App vorher nach.
 
 ## Bauen
-Mit devkitPro/devkitARM: `make -C link3ds`. GitHub Actions baut die App
-automatisch (Workflow „3DS (melonDS Link)“).
+Mit devkitPro/devkitARM: `make` im Hauptordner. GitHub Actions baut die App
+automatisch (Workflow „3DS-Link“) und erzeugt `.3dsx` und `.cia`.
 
 Einstellungen: `sd:/3ds/melonDS-Link.cfg`.
 
 ROMs werden komprimiert übertragen (LZ4, leere Füllbereiche als Marker); der
 Fortschritt zeigt, wie viel das spart. LZ4 © Yann Collet, BSD-2-Lizenz
-(`src/frontend/qt_sdl/lz4/LICENSE`).
+(`lz4/LICENSE`).
 
-Protokoll: `src/frontend/qt_sdl/LinkProto.h` (TCP 6543, UDP 6544 Eingaben, UDP 6545 Bild).
+Protokoll: `include/LinkProto.h` (TCP 6543, UDP 6544 Eingaben, UDP 6545 Bild).
+Dieselbe Datei liegt in der PC-Seite (melonDS-Link: `src/frontend/qt_sdl/LinkProto.h`);
 PC-App und 3DS-App müssen dieselbe Protokollversion haben.
+
+## Herkunft
+Die App ist im Fork [melonDS-Link](https://github.com/AlienGurke/melonDS-Link)
+entstanden (dort früher unter `link3ds/`) und wurde mit ihrem Verlauf in dieses
+Repo verschoben, damit sie später auch andere Emulatoren ansteuern kann.
