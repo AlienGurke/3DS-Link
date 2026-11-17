@@ -4,7 +4,17 @@ Macht deinen 3DS zum Controller für melonDS am PC (Tasten + Touchscreen),
 zeigt den unteren DS-Bildschirm auf dem 3DS an und gibt melonDS Zugriff auf
 die SD-Karte (Spielstände, später ROMs).
 
-## Benutzung
+## Mit Azahar (3DS-Spiele)
+Dieselbe App funktioniert auch mit [Azahar-Link](https://github.com/AlienGurke/Azahar-Link).
+In Azahar: **3DS Link → Mit 3DS verbinden…** und die IP eingeben. Die App erkennt
+Azahar von selbst:
+- Tasten, Circle Pad, C-Stick, ZL/ZR und der Touchscreen gehen an das 3DS-Spiel.
+- Der untere Bildschirm des Spiels erscheint 1:1 auf dem 3DS.
+- Die Spieleliste und die DS-Menüpunkte (Anzeige, Screenshots, Backups) sind
+  ausgeblendet; SELECT+START öffnet weiter das Menü.
+- In den Texten steht „Azahar“ statt „melonDS“.
+
+## Benutzung (melonDS)
 1. `melonDS-Link.cia` mit FBI installieren (Symbol im Home-Menü) – oder
    `melonDS-Link.3dsx` nach `sd:/3ds/` kopieren und über den Homebrew Launcher starten.
 2. Oben steht die IP-Adresse. In melonDS: **3DS Link → Mit 3DS verbinden…** und die IP eingeben.

@@ -77,6 +77,14 @@ static int g_lang = LANG_EN;
 static const char* const g_langCodes[LANG_COUNT] = { "en", "de" };
 static volatile bool g_haveLangEvent = false;   /* tell melonDS about a new language */
 
+/* the emulator on the PC (LINK_CLIENT_*, from its HELLO; remembered in the
+   settings). Azahar runs 3DS games: their bottom screen is shown 1:1, the
+   C-stick belongs to the game and there is no game list. */
+static volatile u32 g_client = LINK_CLIENT_MELONDS;
+static volatile bool g_clientChanged = false;   /* server thread -> main loop */
+#define NATIVE() (g_client == LINK_CLIENT_AZAHAR)
+static const char* emulatorName(void) { return NATIVE() ? "Azahar" : "melonDS"; }
+
 enum StrId
 {
     S_TITLE, S_IP, S_CONNECTED, S_WAITING, S_CONTROLS, S_ACTIVE, S_PICTURE, S_DISPLAY,
@@ -226,11 +234,34 @@ static void loadLanguageFiles(void)
     }
 }
 
+/* the texts say "melonDS"; with another emulator its name is put in */
+static void putEmulatorName(char* s, size_t size)
+{
+    const char* name = emulatorName();
+    if (strcmp(name, "melonDS") == 0) return;
+    char out[160];
+    size_t o = 0;
+    for (const char* p = s; *p && o + 1 < sizeof(out);)
+    {
+        if (strncmp(p, "melonDS", 7) == 0)
+        {
+            for (const char* n = name; *n && o + 1 < sizeof(out); n++) out[o++] = *n;
+            p += 7;
+        }
+        else out[o++] = *p++;
+    }
+    out[o] = 0;
+    snprintf(s, size, "%s", out);
+}
+
 static void applyLanguage(void)
 {
     if (g_lang < 0 || g_lang >= LANG_COUNT) g_lang = LANG_EN;
     for (int i = 0; i < S_COUNT; i++)
+    {
         utf8ToCp437(g_tr[i], sizeof(g_tr[i]), g_custom[g_lang][i][0] ? g_custom[g_lang][i] : g_strs[g_lang][i]);
+        putEmulatorName(g_tr[i], sizeof(g_tr[i]));
+    }
 }
 #define T(id) (g_tr[id])
 
@@ -426,6 +457,24 @@ static u32 g_bakToken = 0;
 static bool g_haveBakReqEv = false, g_haveRestoreEv = false;
 
 /* pending launch for melonDS (guarded by g_lock) */
+/* the picture: DS 256x192 (melonDS) or 3DS 320x240 (Azahar), RGB565, row-major */
+static u16 g_dsImage[240 * 320];          /* what is shown (row length g_vidW) */
+static u16 g_dsBack[240 * 320];           /* tiles are decoded here first */
+static volatile int g_vidW = 256, g_vidH = 192;
+
+/* picture size for the emulator on the PC; the old picture is dropped */
+static void setVideoGeometry(u32 client)
+{
+    int w = client == LINK_CLIENT_AZAHAR ? 320 : 256;
+    int h = client == LINK_CLIENT_AZAHAR ? 240 : 192;
+    if (w == g_vidW && h == g_vidH) return;
+    g_vidW = w;
+    g_vidH = h;
+    memset(g_dsBack, 0, sizeof(g_dsBack));
+    memset(g_dsImage, 0, sizeof(g_dsImage));
+}
+static volatile u64 g_lastVideoTime = 0;
+
 static bool g_haveEvent = false;
 static LinkEvent g_event;
 static char g_eventRom[LINK_MAX_PATH];
@@ -903,6 +952,18 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
         snprintf(r.lang, sizeof(r.lang), "%s", g_langCodes[g_lang]);
         r.flags = g_videoOff ? LINK_HELLO_VIDEO_OFF : 0;
         uint32_t ver = (h->len >= 4) ? *(uint32_t*)payload : 0;
+        if (ver == LINK_VERSION)
+        {
+            uint32_t client = (h->len >= 8) ? ((uint32_t*)payload)[1] : LINK_CLIENT_MELONDS;
+            if (client != LINK_CLIENT_AZAHAR) client = LINK_CLIENT_MELONDS;
+            setVideoGeometry(client);
+            if (client != g_client)
+            {
+                g_client = client;
+                g_lastVideoTime = 0;
+                g_clientChanged = true;
+            }
+        }
         return sendResponse(fd, h, ver == LINK_VERSION ? LINK_OK : LINK_ERR_VERSION, &r, sizeof(r));
     }
 
@@ -1600,10 +1661,7 @@ static void serverThread(void* arg)
 /* ------------------------------------------------------------------ */
 /* DS bottom screen image (filled by the video thread)                 */
 
-static u16 g_dsImage[192 * 256];          /* RGB565, row-major: what is shown */
-static u16 g_dsBack[192 * 256];           /* tiles are decoded here first */
 static volatile u32 g_videoFrames = 0;    /* bumps on every received packet */
-static volatile u64 g_lastVideoTime = 0;
 static volatile bool g_zoom = true;   /* enlarged is the default */
 static u32 g_menuKeys = 0;            /* key presses for the game list (g_lock) */
 static int g_videoFd = -1;
@@ -1639,18 +1697,18 @@ static void noteVideoSeq(u32 seq)
     LightLock_Unlock(&g_ackLock);
 }
 
-static void decodeTile(int type, const u8* p, int tx, int ty)
+static void decodeTile(int type, const u8* p, int tx, int ty, int W)
 {
-    u16* dst = &g_dsBack[ty * 256 + tx];
+    u16* dst = &g_dsBack[ty * W + tx];
     switch (type)
     {
     case LINK_TILE_RAW:
-        for (int y = 0; y < 8; y++) memcpy(dst + y * 256, p + y * 16, 16);
+        for (int y = 0; y < 8; y++) memcpy(dst + y * W, p + y * 16, 16);
         break;
     case LINK_TILE_SOLID_T:
     {
         u16 c; memcpy(&c, p, 2);
-        for (int y = 0; y < 8; y++) for (int x = 0; x < 8; x++) dst[y * 256 + x] = c;
+        for (int y = 0; y < 8; y++) for (int x = 0; x < 8; x++) dst[y * W + x] = c;
         break;
     }
     case LINK_TILE_PAL2:
@@ -1658,7 +1716,7 @@ static void decodeTile(int type, const u8* p, int tx, int ty)
         u16 pal[2]; memcpy(pal, p, 4);
         const u8* bits = p + 4;
         for (int y = 0; y < 8; y++)
-            for (int x = 0; x < 8; x++) dst[y * 256 + x] = pal[(bits[y] >> x) & 1];
+            for (int x = 0; x < 8; x++) dst[y * W + x] = pal[(bits[y] >> x) & 1];
         break;
     }
     case LINK_TILE_PAL4:
@@ -1667,7 +1725,7 @@ static void decodeTile(int type, const u8* p, int tx, int ty)
         for (int y = 0; y < 8; y++)
         {
             u16 row; memcpy(&row, p + 8 + y * 2, 2);
-            for (int x = 0; x < 8; x++) dst[y * 256 + x] = pal[(row >> (x * 2)) & 3];
+            for (int x = 0; x < 8; x++) dst[y * W + x] = pal[(row >> (x * 2)) & 3];
         }
         break;
     }
@@ -1675,14 +1733,14 @@ static void decodeTile(int type, const u8* p, int tx, int ty)
     {
         u16 px[4]; memcpy(px, p, 8);
         for (int y = 0; y < 8; y++)
-            for (int x = 0; x < 8; x++) dst[y * 256 + x] = px[(y >> 2) * 2 + (x >> 2)];
+            for (int x = 0; x < 8; x++) dst[y * W + x] = px[(y >> 2) * 2 + (x >> 2)];
         break;
     }
     case LINK_TILE_HALF:
     {
         u16 px[16]; memcpy(px, p, 32);
         for (int y = 0; y < 8; y++)
-            for (int x = 0; x < 8; x++) dst[y * 256 + x] = px[(y >> 1) * 4 + (x >> 1)];
+            for (int x = 0; x < 8; x++) dst[y * W + x] = px[(y >> 1) * 4 + (x >> 1)];
         break;
     }
     case LINK_TILE_PAL16:
@@ -1691,7 +1749,7 @@ static void decodeTile(int type, const u8* p, int tx, int ty)
         for (int y = 0; y < 8; y++)
         {
             u32 row; memcpy(&row, p + 32 + y * 4, 4);
-            for (int x = 0; x < 8; x++) dst[y * 256 + x] = pal[(row >> (x * 4)) & 15];
+            for (int x = 0; x < 8; x++) dst[y * W + x] = pal[(row >> (x * 4)) & 15];
         }
         break;
     }
@@ -1810,6 +1868,9 @@ static void videoThread(void* arg)
 
         const u8* p = buf + sizeof(fp);
         const u8* end = buf + n;
+        /* read the size once: it may change (other emulator) while we decode */
+        const int vw = g_vidW, vh = g_vidH;
+        const int tilesX = vw / 8, tilesY = vh / 8;
         for (u32 e = 0; e < fp.entryCount; e++)
         {
             if (p + 2 > end) break;
@@ -1819,8 +1880,8 @@ static void videoThread(void* arg)
             int idx = head & LINK_TILE_INDEX_MASK;
             int type = head >> LINK_TILE_TYPE_SHIFT;
             int size = tilePayloadSize(type);
-            if (idx >= LINK_TILE_COUNT || size < 0 || p + size > end) break;
-            decodeTile(type, p, (idx % LINK_TILES_X) * 8, (idx / LINK_TILES_X) * 8);
+            if (idx >= tilesX * tilesY || size < 0 || p + size > end) break;
+            decodeTile(type, p, (idx % tilesX) * 8, (idx / tilesX) * 8, vw);
             p += size;
         }
         noteVideoSeq(fp.seq);
@@ -1952,8 +2013,10 @@ static void inputThread(void* arg)
         /* C-stick down opens/closes the game list */
         bool dialog = g_askActive || g_localAsk != LA_NONE;
         bool capture = g_menuOpen || g_linkMenuOpen || g_bakOpen || dialog;
-        if ((down & KEY_CSTICK_UP) && !dialog) g_zoom = !g_zoom;
-        if ((down & KEY_CSTICK_DOWN) && !dialog)
+        /* with a 3DS game (Azahar) the C-stick belongs to the game */
+        bool native = NATIVE();
+        if ((down & KEY_CSTICK_UP) && !dialog && !native) g_zoom = !g_zoom;
+        if ((down & KEY_CSTICK_DOWN) && !dialog && !native)
         {
             if (!g_menuOpen) { g_menuOpen = true; g_linkMenuOpen = false; g_bakOpen = false; }
             else if (g_gameStarted) g_menuOpen = false;
@@ -1995,7 +2058,7 @@ static void inputThread(void* arg)
         irrstCstickRead(&cstick);
 
         u16 dsX = 0, dsY = 0;
-        bool dsTouch = (gameKeys & KEY_TOUCH) && mapTouch(touch.px, touch.py, g_zoom, &dsX, &dsY);
+        bool dsTouch = !native && (gameKeys & KEY_TOUCH) && mapTouch(touch.px, touch.py, g_zoom, &dsX, &dsY);
 
         if (havePeer && !g_bulkActive)
         {
@@ -2094,7 +2157,20 @@ static void drawBottom(bool haveVideo, bool zoom, bool touching, int tx, int ty)
     const u16 frame = LINK_RGB565(0x50, 0x50, 0x60);
     const u16 empty = LINK_RGB565(0x22, 0x22, 0x2A);
 
-    if (zoom)
+    if (g_vidW == 320)
+    {
+        /* 3DS bottom screen (Azahar): exactly the size of ours */
+        if (!haveVideo)
+            for (int i = 0; i < 320 * 240; i++) fb[i] = empty;
+        else
+            for (int x = 0; x < 320; x++)
+            {
+                const u16* src = g_dsImage + x;
+                u16* col = fb + x * 240 + 239;
+                for (int y = 0; y < 240; y++) col[-y] = src[y * 320];
+            }
+    }
+    else if (zoom)
     {
         /* 256x192 -> 320x240, nearest neighbour, with precomputed source rows/columns */
         static u16 srcRow[240];   /* framebuffer y (rotated) -> DS image row offset */
@@ -2229,6 +2305,7 @@ static void loadConfig(void)
         else if (sscanf(line, "shotmode=%d", &v) == 1) g_shotMode = v >= 0 && v < LINK_SHOT_MODES ? v : 0;
         else if (sscanf(line, "statusbar=%d", &v) == 1) g_statusBar = v != 0;
         else if (sscanf(line, "lang=%d", &v) == 1) g_lang = v;
+        else if (sscanf(line, "client=%d", &v) == 1) g_client = v == (int)LINK_CLIENT_AZAHAR ? LINK_CLIENT_AZAHAR : LINK_CLIENT_MELONDS;
         else if (strncmp(line, "last=", 5) == 0)
         {
             snprintf(g_lastGame, sizeof(g_lastGame), "%s", line + 5);
@@ -2253,6 +2330,7 @@ static void saveConfig(void)
     fprintf(f, "shotmode=%d\n", g_shotMode);
     fprintf(f, "statusbar=%d\n", g_statusBar ? 1 : 0);
     fprintf(f, "lang=%d\n", g_lang);
+    fprintf(f, "client=%d\n", (int)g_client);
     fprintf(f, "romdir=%s\n", g_romDir);
     if (g_lastGame[0]) fprintf(f, "last=%s\n", g_lastGame);
     fclose(f);
@@ -2325,6 +2403,7 @@ int main(int argc, char** argv)
     static aptHookCookie hookCookie;
     aptHook(&hookCookie, aptHookFunc, NULL);
     loadConfig();
+    setVideoGeometry(g_client);
     loadLanguageFiles();
     applyLanguage();
     loadFavs();
@@ -2394,6 +2473,17 @@ int main(int argc, char** argv)
         LightLock_Unlock(&g_lock);
         if (in.quit) break;
 
+        if (g_clientChanged)
+        {
+            /* another emulator connected: its name in the texts, its picture size */
+            g_clientChanged = false;
+            applyLanguage();
+            saveConfig();
+            redrawBoth = 2;
+        }
+        bool native = NATIVE();
+        if (native && g_menuOpen) g_menuOpen = false;   /* no game list for 3DS games */
+
         bool haveVideo = g_lastVideoTime != 0 && osGetTime() - g_lastVideoTime < 3000;
         bool zoom = g_zoom;
 
@@ -2438,7 +2528,7 @@ int main(int argc, char** argv)
         {
             g_sessionEnded = false;
             if (g_localAsk == LA_RESUME || g_localAsk == LA_STOP || g_localAsk == LA_SWITCH) g_localAsk = LA_NONE;
-            if (!g_linkMenuOpen) g_menuOpen = true;
+            if (!g_linkMenuOpen && !native) g_menuOpen = true;
         }
         /* a save that never got swapped in (connection lost) does not block quitting forever */
         if (g_saveWriting && osGetTime() - g_saveWriteTime > 15000) g_saveWriting = false;
@@ -2462,7 +2552,7 @@ int main(int argc, char** argv)
                 if (g_linkMenuOpen)
                 {
                     g_linkMenuOpen = false;
-                    if (!g_gameStarted) g_menuOpen = true;
+                    if (!g_gameStarted && !native) g_menuOpen = true;
                 }
                 else
                 {
@@ -2540,10 +2630,10 @@ int main(int argc, char** argv)
         enum { MI_BACK, MI_GAMES, MI_SHOT, MI_SHOTMODE, MI_BACKUPS, MI_DISPLAY, MI_BOTTOM, MI_TOPOFF, MI_STATUSBAR, MI_LANG, MI_STOP, MI_QUIT };
         int items[12], itemCount = 0;
         bool playing = g_gameStarted && !g_launchPending;
-        if (g_gameStarted) items[itemCount++] = MI_BACK;
-        items[itemCount++] = MI_GAMES;
-        if (playing && g_tcpConnected) items[itemCount++] = MI_SHOT;
-        items[itemCount++] = MI_SHOTMODE;
+        if (g_gameStarted || native) items[itemCount++] = MI_BACK;
+        if (!native) items[itemCount++] = MI_GAMES;
+        if (playing && g_tcpConnected && !native) items[itemCount++] = MI_SHOT;
+        if (!native) items[itemCount++] = MI_SHOTMODE;
         /* backups: of the running game, else of the game selected in the list */
         int bakGame = -1;
         if (g_gameStarted)
@@ -2555,19 +2645,19 @@ int main(int argc, char** argv)
             }
         }
         else if (menuCursor >= 0 && menuCursor < g_gameCount) bakGame = menuCursor;
-        if (bakGame >= 0 && g_tcpConnected && !g_launchPending) items[itemCount++] = MI_BACKUPS;
-        items[itemCount++] = MI_DISPLAY;
+        if (bakGame >= 0 && g_tcpConnected && !g_launchPending && !native) items[itemCount++] = MI_BACKUPS;
+        if (!native) items[itemCount++] = MI_DISPLAY;
         items[itemCount++] = MI_BOTTOM;
         items[itemCount++] = MI_TOPOFF;
         items[itemCount++] = MI_STATUSBAR;
         items[itemCount++] = MI_LANG;
-        if (playing && g_tcpConnected) items[itemCount++] = MI_STOP;
+        if (playing && g_tcpConnected && !native) items[itemCount++] = MI_STOP;
         items[itemCount++] = MI_QUIT;
         if (linkCursor >= itemCount) linkCursor = itemCount - 1;
         if (linkCursor < 0) linkCursor = 0;
 
         /* back to the game if there is one, else to the game list */
-        #define CLOSE_MENU() do { g_linkMenuOpen = false; if (!g_gameStarted) g_menuOpen = true; } while (0)
+        #define CLOSE_MENU() do { g_linkMenuOpen = false; if (!g_gameStarted && !native) g_menuOpen = true; } while (0)
 
         if (askActive && mk)
         {
@@ -2779,7 +2869,7 @@ int main(int argc, char** argv)
         setLine(4, "%-12s %s%s", "melonDS:", g_tcpConnected ? "\x1b[32m" : "\x1b[90m", g_tcpConnected ? T(S_CONNECTED) : T(S_WAITING));
         setLine(5, "%-12s %s%s\x1b[0m   %s %s%s", T(S_CONTROLS), in.haveUdpPeer ? "\x1b[32m" : "\x1b[90m",
                 in.haveUdpPeer ? T(S_ACTIVE) : "-", T(S_PICTURE), haveVideo ? "\x1b[32m" : "\x1b[90m", haveVideo ? "ok" : "-");
-        setLine(6, "%-12s %s", T(S_DISPLAY), zoom ? T(S_ENLARGED) : T(S_ORIGINAL));
+        setLine(6, "%-12s %s", T(S_DISPLAY), zoom && !native ? T(S_ENLARGED) : T(S_ORIGINAL));
         setLine(7, "\x1b[90m%.49s", xi);
         setLine(8, "\x1b[33m%.49s", status);
         setLine(9, "\x1b[90m%.49s", xi2);
@@ -2965,7 +3055,7 @@ int main(int argc, char** argv)
         }
 
         setLine(28, "\x1b[90m%s", T(S_HINT_MENU));
-        setLine(29, "\x1b[90m%s", isNew3DS ? T(S_HINT_CSTICK) : "");
+        setLine(29, "\x1b[90m%s", isNew3DS && !native ? T(S_HINT_CSTICK) : "");
         setLine(30, "\x1b[90m%s", g_tcpConnected ? "" : T(S_HINT_CONNECT));
 
         gfxFlushBuffers();
