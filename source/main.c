@@ -959,6 +959,12 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
             setVideoGeometry(client);
             if (client != g_client)
             {
+                /* another emulator: the game of the old one does not run there */
+                LightLock_Lock(&g_lock);
+                g_gameStarted = false;
+                g_launchPending = false;
+                g_currentGame[0] = 0;
+                LightLock_Unlock(&g_lock);
                 g_client = client;
                 g_lastVideoTime = 0;
                 g_clientChanged = true;
