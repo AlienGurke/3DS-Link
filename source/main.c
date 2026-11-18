@@ -933,6 +933,29 @@ static bool streamFile(int fd, const LinkHeader* h, const char* path, u64 offset
     return ok && sent == length;
 }
 
+/* system archives (LINK_CMD_ARC*): the path inside the archive, as UTF-16 */
+static u16 g_arcPath[LINK_MAX_PATH + 2];
+
+static bool arcPath(const uint8_t* in, size_t len)
+{
+    if (len >= LINK_MAX_PATH) return false;
+    u8 tmp[LINK_MAX_PATH + 2];
+    size_t o = 0;
+    if (len == 0 || in[0] != '/') tmp[o++] = '/';
+    memcpy(tmp + o, in, len);
+    tmp[o + len] = 0;
+    memset(g_arcPath, 0, sizeof(g_arcPath));
+    ssize_t n = utf8_to_utf16(g_arcPath, tmp, LINK_MAX_PATH);
+    return n > 0;
+}
+
+static bool openLinkArchive(const LinkArchiveReq* req, FS_Archive* arch)
+{
+    u32 lowpath[3] = { req->mediaType, req->lowId, req->highId };
+    return R_SUCCEEDED(FSUSER_OpenArchive(arch, (FS_ArchiveID)req->archive,
+                                          (FS_Path){ PATH_BINARY, sizeof(lowpath), lowpath }));
+}
+
 static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
 {
     char path[LINK_MAX_PATH + 8];
@@ -1376,24 +1399,18 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
 
     case LINK_CMD_ARCREAD:
     {
-        /* a file from a system archive (e.g. the Mii database in shared extdata) */
-        if (h->len <= sizeof(LinkArchiveReq) || h->len - sizeof(LinkArchiveReq) >= LINK_MAX_PATH)
-            return sendResponse(fd, h, LINK_ERR_BADARGS, NULL, 0);
+        /* a part of a file in a system archive (Mii database, saves, extdata) */
         LinkArchiveReq req;
-        memcpy(&req, payload, sizeof(req));
-        char apath[LINK_MAX_PATH + 1];
-        size_t plen = h->len - sizeof(req);
-        memcpy(apath, payload + sizeof(req), plen);
-        apath[plen] = 0;
-        u32 lowpath[3] = { req.mediaType, req.lowId, req.highId };
         FS_Archive arch;
-        if (R_FAILED(FSUSER_OpenArchive(&arch, (FS_ArchiveID)req.archive,
-                                        (FS_Path){ PATH_BINARY, sizeof(lowpath), lowpath })))
+        if (h->len <= sizeof(req) || !arcPath(payload + sizeof(req), h->len - sizeof(req)))
+            return sendResponse(fd, h, LINK_ERR_BADARGS, NULL, 0);
+        memcpy(&req, payload, sizeof(req));
+        if (!openLinkArchive(&req, &arch))
             return sendResponse(fd, h, LINK_ERR_DENIED, NULL, 0);   /* archive not accessible */
         Handle file;
         uint16_t st = LINK_OK;
         u32 got = 0;
-        if (R_FAILED(FSUSER_OpenFile(&file, arch, fsMakePath(PATH_ASCII, apath), FS_OPEN_READ, 0)))
+        if (R_FAILED(FSUSER_OpenFile(&file, arch, fsMakePath(PATH_UTF16, g_arcPath), FS_OPEN_READ, 0)))
             st = LINK_ERR_NOTFOUND;
         else
         {
@@ -1415,6 +1432,70 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
         }
         FSUSER_CloseArchive(arch);
         return sendResponse(fd, h, st, g_outbuf, st == LINK_OK ? got + 4 : 0);
+    }
+
+    case LINK_CMD_ARCLIST:
+    {
+        /* the entries of a folder in a system archive */
+        LinkArchiveReq req;
+        FS_Archive arch;
+        if (h->len < sizeof(req) || !arcPath(payload + sizeof(req), h->len - sizeof(req)))
+            return sendResponse(fd, h, LINK_ERR_BADARGS, NULL, 0);
+        memcpy(&req, payload, sizeof(req));
+        if (!openLinkArchive(&req, &arch))
+            return sendResponse(fd, h, LINK_ERR_DENIED, NULL, 0);
+        Handle dir;
+        if (R_FAILED(FSUSER_OpenDirectory(&dir, arch, fsMakePath(PATH_UTF16, g_arcPath))))
+        {
+            FSUSER_CloseArchive(arch);
+            return sendResponse(fd, h, LINK_ERR_NOTFOUND, NULL, 0);
+        }
+        static FS_DirectoryEntry entries[8];   /* big (0x228 each): not on the thread stack */
+        size_t used = 0;
+        uint16_t st = LINK_OK;
+        for (;;)
+        {
+            u32 n = 0;
+            if (R_FAILED(FSDIR_Read(dir, &n, 8, entries))) { st = LINK_ERR_IO; break; }
+            if (n == 0) break;
+            for (u32 i = 0; i < n; i++)
+            {
+                u8 name[256];
+                memset(name, 0, sizeof(name));
+                utf16_to_utf8(name, entries[i].name, sizeof(name) - 1);
+                size_t nameLen = strlen((const char*)name);
+                LinkDirEntry de;
+                de.size = entries[i].fileSize;
+                de.isDir = (entries[i].attributes & FS_ATTRIBUTE_DIRECTORY) ? 1 : 0;
+                de.nameLen = (u8)nameLen;
+                if (used + sizeof(de) + nameLen > LINK_MAX_PAYLOAD) { st = LINK_ERR_IO; break; }
+                memcpy(g_outbuf + used, &de, sizeof(de));
+                memcpy(g_outbuf + used + sizeof(de), name, nameLen);
+                used += sizeof(de) + nameLen;
+            }
+            if (st != LINK_OK) break;
+        }
+        FSDIR_Close(dir);
+        FSUSER_CloseArchive(arch);
+        return sendResponse(fd, h, st, g_outbuf, st == LINK_OK ? (uint32_t)used : 0);
+    }
+
+    case LINK_CMD_ARCINFO:
+    {
+        /* how the archive was formatted (the emulator needs it for a new save) */
+        LinkArchiveReq req;
+        if (h->len < sizeof(req)) return sendResponse(fd, h, LINK_ERR_BADARGS, NULL, 0);
+        memcpy(&req, payload, sizeof(req));
+        u32 lowpath[3] = { req.mediaType, req.lowId, req.highId };
+        LinkFormatInfo fi;
+        memset(&fi, 0, sizeof(fi));
+        bool dup = false;
+        if (R_FAILED(FSUSER_GetFormatInfo(&fi.totalSize, &fi.directories, &fi.files, &dup,
+                                          (FS_ArchiveID)req.archive,
+                                          (FS_Path){ PATH_BINARY, sizeof(lowpath), lowpath })))
+            return sendResponse(fd, h, LINK_ERR_NOTFOUND, NULL, 0);
+        fi.duplicateData = dup ? 1 : 0;
+        return sendResponse(fd, h, LINK_OK, &fi, sizeof(fi));
     }
 
     case LINK_CMD_GETSTATS:
