@@ -949,11 +949,14 @@ static bool arcPath(const uint8_t* in, size_t len)
     return n > 0;
 }
 
+static Result g_arcResult;   /* why the last archive call failed (sent with the error) */
+
 static bool openLinkArchive(const LinkArchiveReq* req, FS_Archive* arch)
 {
     u32 lowpath[3] = { req->mediaType, req->lowId, req->highId };
-    return R_SUCCEEDED(FSUSER_OpenArchive(arch, (FS_ArchiveID)req->archive,
-                                          (FS_Path){ PATH_BINARY, sizeof(lowpath), lowpath }));
+    g_arcResult = FSUSER_OpenArchive(arch, (FS_ArchiveID)req->archive,
+                                     (FS_Path){ PATH_BINARY, sizeof(lowpath), lowpath });
+    return R_SUCCEEDED(g_arcResult);
 }
 
 static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
@@ -1405,12 +1408,12 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
         if (h->len <= sizeof(req) || !arcPath(payload + sizeof(req), h->len - sizeof(req)))
             return sendResponse(fd, h, LINK_ERR_BADARGS, NULL, 0);
         memcpy(&req, payload, sizeof(req));
-        if (!openLinkArchive(&req, &arch))
-            return sendResponse(fd, h, LINK_ERR_DENIED, NULL, 0);   /* archive not accessible */
+        if (!openLinkArchive(&req, &arch))   /* archive not accessible */
+            return sendResponse(fd, h, LINK_ERR_DENIED, &g_arcResult, sizeof(g_arcResult));
         Handle file;
         uint16_t st = LINK_OK;
         u32 got = 0;
-        if (R_FAILED(FSUSER_OpenFile(&file, arch, fsMakePath(PATH_UTF16, g_arcPath), FS_OPEN_READ, 0)))
+        if (R_FAILED(g_arcResult = FSUSER_OpenFile(&file, arch, fsMakePath(PATH_UTF16, g_arcPath), FS_OPEN_READ, 0)))
             st = LINK_ERR_NOTFOUND;
         else
         {
@@ -1431,6 +1434,7 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
             FSFILE_Close(file);
         }
         FSUSER_CloseArchive(arch);
+        if (st == LINK_ERR_NOTFOUND) return sendResponse(fd, h, st, &g_arcResult, sizeof(g_arcResult));
         return sendResponse(fd, h, st, g_outbuf, st == LINK_OK ? got + 4 : 0);
     }
 
@@ -1443,12 +1447,12 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
             return sendResponse(fd, h, LINK_ERR_BADARGS, NULL, 0);
         memcpy(&req, payload, sizeof(req));
         if (!openLinkArchive(&req, &arch))
-            return sendResponse(fd, h, LINK_ERR_DENIED, NULL, 0);
+            return sendResponse(fd, h, LINK_ERR_DENIED, &g_arcResult, sizeof(g_arcResult));
         Handle dir;
-        if (R_FAILED(FSUSER_OpenDirectory(&dir, arch, fsMakePath(PATH_UTF16, g_arcPath))))
+        if (R_FAILED(g_arcResult = FSUSER_OpenDirectory(&dir, arch, fsMakePath(PATH_UTF16, g_arcPath))))
         {
             FSUSER_CloseArchive(arch);
-            return sendResponse(fd, h, LINK_ERR_NOTFOUND, NULL, 0);
+            return sendResponse(fd, h, LINK_ERR_NOTFOUND, &g_arcResult, sizeof(g_arcResult));
         }
         static FS_DirectoryEntry entries[8];   /* big (0x228 each): not on the thread stack */
         size_t used = 0;
@@ -1478,6 +1482,28 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
         FSDIR_Close(dir);
         FSUSER_CloseArchive(arch);
         return sendResponse(fd, h, st, g_outbuf, st == LINK_OK ? (uint32_t)used : 0);
+    }
+
+    case LINK_CMD_TITLES:
+    {
+        /* installed titles (SD card) and the game card, e.g. to find a game's save */
+        size_t used = 0;
+        if (R_SUCCEEDED(amInit()))
+        {
+            const FS_MediaType media[2] = { MEDIATYPE_SD, MEDIATYPE_GAME_CARD };
+            for (int m = 0; m < 2; m++)
+            {
+                u32 count = 0, read = 0;
+                u32 maxIds = (u32)((LINK_MAX_PAYLOAD / 2 - 4) / 8);
+                if (R_FAILED(AM_GetTitleCount(media[m], &count))) count = 0;
+                if (count > maxIds) count = maxIds;
+                if (count && R_FAILED(AM_GetTitleList(&read, media[m], count, (u64*)(g_outbuf + used + 4)))) read = 0;
+                memcpy(g_outbuf + used, &read, 4);
+                used += 4 + (size_t)read * 8;
+            }
+            amExit();
+        }
+        return sendResponse(fd, h, used ? LINK_OK : LINK_ERR_IO, g_outbuf, (uint32_t)used);
     }
 
     case LINK_CMD_ARCINFO:
