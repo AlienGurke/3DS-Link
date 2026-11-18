@@ -1367,6 +1367,13 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
         return true;
     }
 
+    case LINK_CMD_GETTIME:
+    {
+        /* the clock the games see, so the emulator can run on the same time */
+        u64 t = osGetTime();
+        return sendResponse(fd, h, LINK_OK, &t, sizeof(t));
+    }
+
     case LINK_CMD_ARCREAD:
     {
         /* a file from a system archive (e.g. the Mii database in shared extdata) */
