@@ -1382,7 +1382,7 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
         FS_Archive arch;
         if (R_FAILED(FSUSER_OpenArchive(&arch, (FS_ArchiveID)req.archive,
                                         (FS_Path){ PATH_BINARY, sizeof(lowpath), lowpath })))
-            return sendResponse(fd, h, LINK_ERR_NOTFOUND, NULL, 0);
+            return sendResponse(fd, h, LINK_ERR_DENIED, NULL, 0);   /* archive not accessible */
         Handle file;
         uint16_t st = LINK_OK;
         u32 got = 0;
@@ -1390,14 +1390,24 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
             st = LINK_ERR_NOTFOUND;
         else
         {
+            /* answer: u32 size of the whole file, then the part asked for */
             u64 size = 0;
-            if (R_FAILED(FSFILE_GetSize(file, &size)) || size > LINK_MAX_PAYLOAD ||
-                R_FAILED(FSFILE_Read(file, &got, 0, g_outbuf, (u32)size)) || got != size)
+            u32 want = req.length < LINK_MAX_PAYLOAD - 4 ? req.length : LINK_MAX_PAYLOAD - 4;
+            if (R_FAILED(FSFILE_GetSize(file, &size)) || size > 0xFFFFFFFFull)
                 st = LINK_ERR_IO;
+            else
+            {
+                if ((u64)req.offset >= size) want = 0;
+                else if (req.offset + (u64)want > size) want = (u32)(size - req.offset);
+                u32 total = (u32)size;
+                memcpy(g_outbuf, &total, 4);
+                if (want && (R_FAILED(FSFILE_Read(file, &got, req.offset, g_outbuf + 4, want)) || got != want))
+                    st = LINK_ERR_IO;
+            }
             FSFILE_Close(file);
         }
         FSUSER_CloseArchive(arch);
-        return sendResponse(fd, h, st, g_outbuf, st == LINK_OK ? got : 0);
+        return sendResponse(fd, h, st, g_outbuf, st == LINK_OK ? got + 4 : 0);
     }
 
     case LINK_CMD_GETSTATS:
