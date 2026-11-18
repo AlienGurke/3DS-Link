@@ -2922,7 +2922,9 @@ int main(int argc, char** argv)
             setLine(1, "\x1b[36m%s\x1b[0m  \x1b[90mv%u%s", T(S_TITLE), (unsigned)LINK_VERSION, st);
         }
         setLine(3, "%-12s \x1b[33m%s", T(S_IP), inet_ntoa(ip));
-        setLine(4, "%-12s %s%s", "melonDS:", g_tcpConnected ? "\x1b[32m" : "\x1b[90m", g_tcpConnected ? T(S_CONNECTED) : T(S_WAITING));
+        char emuLabel[16];
+        snprintf(emuLabel, sizeof(emuLabel), "%s:", emulatorName());
+        setLine(4, "%-12s %s%s", emuLabel, g_tcpConnected ? "\x1b[32m" : "\x1b[90m", g_tcpConnected ? T(S_CONNECTED) : T(S_WAITING));
         setLine(5, "%-12s %s%s\x1b[0m   %s %s%s", T(S_CONTROLS), in.haveUdpPeer ? "\x1b[32m" : "\x1b[90m",
                 in.haveUdpPeer ? T(S_ACTIVE) : "-", T(S_PICTURE), haveVideo ? "\x1b[32m" : "\x1b[90m", haveVideo ? "ok" : "-");
         setLine(6, "%-12s %s", T(S_DISPLAY), zoom && !native ? T(S_ENLARGED) : T(S_ORIGINAL));
