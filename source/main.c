@@ -1367,6 +1367,39 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
         return true;
     }
 
+    case LINK_CMD_ARCREAD:
+    {
+        /* a file from a system archive (e.g. the Mii database in shared extdata) */
+        if (h->len <= sizeof(LinkArchiveReq) || h->len - sizeof(LinkArchiveReq) >= LINK_MAX_PATH)
+            return sendResponse(fd, h, LINK_ERR_BADARGS, NULL, 0);
+        LinkArchiveReq req;
+        memcpy(&req, payload, sizeof(req));
+        char apath[LINK_MAX_PATH + 1];
+        size_t plen = h->len - sizeof(req);
+        memcpy(apath, payload + sizeof(req), plen);
+        apath[plen] = 0;
+        u32 lowpath[3] = { req.mediaType, req.lowId, req.highId };
+        FS_Archive arch;
+        if (R_FAILED(FSUSER_OpenArchive(&arch, (FS_ArchiveID)req.archive,
+                                        (FS_Path){ PATH_BINARY, sizeof(lowpath), lowpath })))
+            return sendResponse(fd, h, LINK_ERR_NOTFOUND, NULL, 0);
+        Handle file;
+        uint16_t st = LINK_OK;
+        u32 got = 0;
+        if (R_FAILED(FSUSER_OpenFile(&file, arch, fsMakePath(PATH_ASCII, apath), FS_OPEN_READ, 0)))
+            st = LINK_ERR_NOTFOUND;
+        else
+        {
+            u64 size = 0;
+            if (R_FAILED(FSFILE_GetSize(file, &size)) || size > LINK_MAX_PAYLOAD ||
+                R_FAILED(FSFILE_Read(file, &got, 0, g_outbuf, (u32)size)) || got != size)
+                st = LINK_ERR_IO;
+            FSFILE_Close(file);
+        }
+        FSUSER_CloseArchive(arch);
+        return sendResponse(fd, h, st, g_outbuf, st == LINK_OK ? got : 0);
+    }
+
     case LINK_CMD_GETSTATS:
     {
         char txt[384];

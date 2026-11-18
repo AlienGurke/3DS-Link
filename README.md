@@ -13,6 +13,9 @@ Azahar von selbst:
 - Die Spieleliste und die DS-Menüpunkte (Anzeige, Screenshots, Backups) sind
   ausgeblendet; SELECT+START öffnet weiter das Menü.
 - In den Texten steht „Azahar“ statt „melonDS“.
+- Beim Verbinden übernimmt Azahar die Miis des 3DS (Mii-Maker-Datenbank), damit
+  Spiele wie Pokémon Rumble World einen Mii finden. Azahars eigene Datenbank wird
+  einmal als `CFL_DB.dat.before-3ds-link` aufgehoben.
 
 ## Benutzung (melonDS)
 1. `melonDS-Link.cia` mit FBI installieren (Symbol im Home-Menü) – oder
