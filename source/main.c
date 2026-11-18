@@ -954,8 +954,11 @@ static Result g_arcResult;   /* why the last archive call failed (sent with the 
 static bool openLinkArchive(const LinkArchiveReq* req, FS_Archive* arch)
 {
     u32 lowpath[3] = { req->mediaType, req->lowId, req->highId };
-    g_arcResult = FSUSER_OpenArchive(arch, (FS_ArchiveID)req->archive,
-                                     (FS_Path){ PATH_BINARY, sizeof(lowpath), lowpath });
+    if (req->mediaType == LINK_MEDIA_NOPATH)   /* e.g. CTR-NAND: the archive has no path */
+        g_arcResult = FSUSER_OpenArchive(arch, (FS_ArchiveID)req->archive, (FS_Path){ PATH_EMPTY, 1, "" });
+    else
+        g_arcResult = FSUSER_OpenArchive(arch, (FS_ArchiveID)req->archive,
+                                         (FS_Path){ PATH_BINARY, sizeof(lowpath), lowpath });
     return R_SUCCEEDED(g_arcResult);
 }
 
