@@ -1441,6 +1441,72 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
         return sendResponse(fd, h, st, g_outbuf, st == LINK_OK ? got + 4 : 0);
     }
 
+    case LINK_CMD_ARCREADZ:
+    case LINK_CMD_ARCHASH:
+    {
+        /* a part of a file, compressed (saves are often mostly empty), or its hash */
+        static u8* raw = NULL;
+        if (!raw) raw = (u8*)memalign(0x40, LINK_ARCZ_MAX_CHUNK);
+        LinkArchiveReq req;
+        FS_Archive arch;
+        if (!raw) return sendResponse(fd, h, LINK_ERR_IO, NULL, 0);
+        if (h->len <= sizeof(req) || !arcPath(payload + sizeof(req), h->len - sizeof(req)))
+            return sendResponse(fd, h, LINK_ERR_BADARGS, NULL, 0);
+        memcpy(&req, payload, sizeof(req));
+        if (!openLinkArchive(&req, &arch))
+            return sendResponse(fd, h, LINK_ERR_DENIED, &g_arcResult, sizeof(g_arcResult));
+        Handle file;
+        if (R_FAILED(g_arcResult = FSUSER_OpenFile(&file, arch, fsMakePath(PATH_UTF16, g_arcPath), FS_OPEN_READ, 0)))
+        {
+            FSUSER_CloseArchive(arch);
+            return sendResponse(fd, h, LINK_ERR_NOTFOUND, &g_arcResult, sizeof(g_arcResult));
+        }
+        uint16_t st = LINK_OK;
+        u32 outLen = 0;
+        u64 size = 0;
+        if (R_FAILED(FSFILE_GetSize(file, &size)) || size > 0xFFFFFFFFull) st = LINK_ERR_IO;
+        else if (h->cmd == LINK_CMD_ARCHASH)
+        {
+            u64 hash = LINK_FNV64_INIT;
+            for (u64 pos = 0; pos < size && st == LINK_OK;)
+            {
+                u32 want = size - pos > LINK_ARCZ_MAX_CHUNK ? LINK_ARCZ_MAX_CHUNK : (u32)(size - pos);
+                u32 got = 0;
+                if (R_FAILED(FSFILE_Read(file, &got, pos, raw, want)) || got != want) { st = LINK_ERR_IO; break; }
+                for (u32 i = 0; i < got; i++) hash = (hash ^ raw[i]) * LINK_FNV64_PRIME;
+                pos += got;
+            }
+            memcpy(g_outbuf, &size, 8);
+            memcpy(g_outbuf + 8, &hash, 8);
+            outLen = 16;
+        }
+        else
+        {
+            u32 want = req.length < LINK_ARCZ_MAX_CHUNK ? req.length : LINK_ARCZ_MAX_CHUNK;
+            if ((u64)req.offset >= size) want = 0;
+            else if (req.offset + (u64)want > size) want = (u32)(size - req.offset);
+            u32 got = 0;
+            if (want && (R_FAILED(FSFILE_Read(file, &got, req.offset, raw, want)) || got != want)) st = LINK_ERR_IO;
+            else
+            {
+                LinkArcChunk c;
+                memset(&c, 0, sizeof(c));
+                c.totalSize = (u32)size;
+                c.rawLen = want;
+                c.mode = LINK_BLOCK_RAW;
+                int enc = want ? LZ4_compress_fast_extState(&g_lz4State, (const char*)raw,
+                                                            (char*)g_outbuf + sizeof(c), (int)want,
+                                                            (int)(LINK_MAX_PAYLOAD - sizeof(c)), 1) : 0;
+                if (enc > 0 && (u32)enc < want) { c.mode = LINK_BLOCK_LZ4; outLen = sizeof(c) + (u32)enc; }
+                else { memcpy(g_outbuf + sizeof(c), raw, want); outLen = sizeof(c) + want; }
+                memcpy(g_outbuf, &c, sizeof(c));
+            }
+        }
+        FSFILE_Close(file);
+        FSUSER_CloseArchive(arch);
+        return sendResponse(fd, h, st, g_outbuf, st == LINK_OK ? outLen : 0);
+    }
+
     case LINK_CMD_ARCLIST:
     {
         /* the entries of a folder in a system archive */
