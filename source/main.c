@@ -950,16 +950,76 @@ static bool arcPath(const uint8_t* in, size_t len)
 }
 
 static Result g_arcResult;   /* why the last archive call failed (sent with the error) */
+static u8* g_arcRaw;          /* LINK_ARCZ_MAX_CHUNK bytes for reading archive files */
+
+static u8* arcRawBuffer(void)
+{
+    if (!g_arcRaw) g_arcRaw = (u8*)memalign(0x40, LINK_ARCZ_MAX_CHUNK);
+    return g_arcRaw;
+}
+
+/* size and FNV-1a 64 of the file `name` in the folder g_arcPath */
+static bool hashArcFile(FS_Archive arch, const u8* name, u64* outSize, u64* outHash)
+{
+    u8* raw = arcRawBuffer();
+    if (!raw) return false;
+    static u16 path[LINK_MAX_PATH + 300];
+    size_t n = 0;
+    while (g_arcPath[n] && n < LINK_MAX_PATH) { path[n] = g_arcPath[n]; n++; }
+    if (n == 0 || path[n - 1] != '/') path[n++] = '/';
+    ssize_t m = utf8_to_utf16(path + n, name, 290);
+    if (m <= 0) return false;
+    path[n + (size_t)m] = 0;
+    Handle file;
+    if (R_FAILED(FSUSER_OpenFile(&file, arch, fsMakePath(PATH_UTF16, path), FS_OPEN_READ, 0))) return false;
+    u64 size = 0, hash = LINK_FNV64_INIT;
+    bool ok = R_SUCCEEDED(FSFILE_GetSize(file, &size));
+    for (u64 pos = 0; ok && pos < size;)
+    {
+        u32 want = size - pos > LINK_ARCZ_MAX_CHUNK ? LINK_ARCZ_MAX_CHUNK : (u32)(size - pos);
+        u32 got = 0;
+        if (R_FAILED(FSFILE_Read(file, &got, pos, raw, want)) || got != want) { ok = false; break; }
+        for (u32 i = 0; i < got; i++) hash = (hash ^ raw[i]) * LINK_FNV64_PRIME;
+        pos += got;
+    }
+    FSFILE_Close(file);
+    *outSize = size;
+    *outHash = hash;
+    return ok;
+}
+
+/* The archive stays open between requests: opening a save archive takes the 3DS
+   a while, and copying a save asks for every file twice (hash, data). */
+static bool g_arcOpen = false;
+static FS_Archive g_arcHandle;
+static LinkArchiveReq g_arcKey;
+
+static void closeLinkArchive(void)
+{
+    if (g_arcOpen) FSUSER_CloseArchive(g_arcHandle);
+    g_arcOpen = false;
+}
 
 static bool openLinkArchive(const LinkArchiveReq* req, FS_Archive* arch)
 {
+    if (g_arcOpen && g_arcKey.archive == req->archive && g_arcKey.mediaType == req->mediaType &&
+        g_arcKey.lowId == req->lowId && g_arcKey.highId == req->highId)
+    {
+        *arch = g_arcHandle;
+        return true;
+    }
+    closeLinkArchive();
     u32 lowpath[3] = { req->mediaType, req->lowId, req->highId };
     if (req->mediaType == LINK_MEDIA_NOPATH)   /* e.g. CTR-NAND: the archive has no path */
         g_arcResult = FSUSER_OpenArchive(arch, (FS_ArchiveID)req->archive, (FS_Path){ PATH_EMPTY, 1, "" });
     else
         g_arcResult = FSUSER_OpenArchive(arch, (FS_ArchiveID)req->archive,
                                          (FS_Path){ PATH_BINARY, sizeof(lowpath), lowpath });
-    return R_SUCCEEDED(g_arcResult);
+    if (R_FAILED(g_arcResult)) return false;
+    g_arcOpen = true;
+    g_arcHandle = *arch;
+    g_arcKey = *req;
+    return true;
 }
 
 static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
@@ -1436,7 +1496,7 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
             }
             FSFILE_Close(file);
         }
-        FSUSER_CloseArchive(arch);
+        (void)arch;   /* stays open for the next request */
         if (st == LINK_ERR_NOTFOUND) return sendResponse(fd, h, st, &g_arcResult, sizeof(g_arcResult));
         return sendResponse(fd, h, st, g_outbuf, st == LINK_OK ? got + 4 : 0);
     }
@@ -1445,8 +1505,7 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
     case LINK_CMD_ARCHASH:
     {
         /* a part of a file, compressed (saves are often mostly empty), or its hash */
-        static u8* raw = NULL;
-        if (!raw) raw = (u8*)memalign(0x40, LINK_ARCZ_MAX_CHUNK);
+        u8* raw = arcRawBuffer();
         LinkArchiveReq req;
         FS_Archive arch;
         if (!raw) return sendResponse(fd, h, LINK_ERR_IO, NULL, 0);
@@ -1458,7 +1517,7 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
         Handle file;
         if (R_FAILED(g_arcResult = FSUSER_OpenFile(&file, arch, fsMakePath(PATH_UTF16, g_arcPath), FS_OPEN_READ, 0)))
         {
-            FSUSER_CloseArchive(arch);
+            (void)arch;   /* stays open for the next request */
             return sendResponse(fd, h, LINK_ERR_NOTFOUND, &g_arcResult, sizeof(g_arcResult));
         }
         uint16_t st = LINK_OK;
@@ -1503,11 +1562,12 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
             }
         }
         FSFILE_Close(file);
-        FSUSER_CloseArchive(arch);
+        (void)arch;   /* stays open for the next request */
         return sendResponse(fd, h, st, g_outbuf, st == LINK_OK ? outLen : 0);
     }
 
     case LINK_CMD_ARCLIST:
+    case LINK_CMD_ARCLISTHASH:
     {
         /* the entries of a folder in a system archive */
         LinkArchiveReq req;
@@ -1520,7 +1580,7 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
         Handle dir;
         if (R_FAILED(g_arcResult = FSUSER_OpenDirectory(&dir, arch, fsMakePath(PATH_UTF16, g_arcPath))))
         {
-            FSUSER_CloseArchive(arch);
+            (void)arch;   /* stays open for the next request */
             return sendResponse(fd, h, LINK_ERR_NOTFOUND, &g_arcResult, sizeof(g_arcResult));
         }
         static FS_DirectoryEntry entries[8];   /* big (0x228 each): not on the thread stack */
@@ -1541,15 +1601,20 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
                 de.size = entries[i].fileSize;
                 de.isDir = (entries[i].attributes & FS_ATTRIBUTE_DIRECTORY) ? 1 : 0;
                 de.nameLen = (u8)nameLen;
-                if (used + sizeof(de) + nameLen > LINK_MAX_PAYLOAD) { st = LINK_ERR_IO; break; }
+                u64 hash = 0;
+                if (h->cmd == LINK_CMD_ARCLISTHASH && !de.isDir && !hashArcFile(arch, name, &de.size, &hash))
+                { st = LINK_ERR_IO; break; }
+                size_t extra = h->cmd == LINK_CMD_ARCLISTHASH ? 8 : 0;
+                if (used + sizeof(de) + nameLen + extra > LINK_MAX_PAYLOAD) { st = LINK_ERR_IO; break; }
                 memcpy(g_outbuf + used, &de, sizeof(de));
                 memcpy(g_outbuf + used + sizeof(de), name, nameLen);
-                used += sizeof(de) + nameLen;
+                if (extra) memcpy(g_outbuf + used + sizeof(de) + nameLen, &hash, 8);
+                used += sizeof(de) + nameLen + extra;
             }
             if (st != LINK_OK) break;
         }
         FSDIR_Close(dir);
-        FSUSER_CloseArchive(arch);
+        (void)arch;   /* stays open for the next request */
         return sendResponse(fd, h, st, g_outbuf, st == LINK_OK ? (uint32_t)used : 0);
     }
 
@@ -1884,6 +1949,7 @@ static void serverThread(void* arg)
             if (!handleCommand(fd, &h, g_payload)) break;
         }
 
+        closeLinkArchive();   /* the emulator is gone: let go of the save */
         close(fd);
         g_tcpConnected = false;
         setStatusText("");
