@@ -1581,6 +1581,10 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
         if (!raw) return sendResponse(fd, h, LINK_ERR_IO, NULL, 0);
         if (h->len < sizeof(req)) return sendResponse(fd, h, LINK_ERR_BADARGS, NULL, 0);
         memcpy(&req, payload, sizeof(req));
+        /* only system data archives (shared / system data): never games or other titles */
+        u32 category = (u32)(req.titleId >> 32);
+        if (category != 0x0004009Bu && category != 0x000400DBu)
+            return sendResponse(fd, h, LINK_ERR_DENIED, NULL, 0);
         if (g_romfsOpen && g_romfsTid != req.titleId) { FSFILE_Close(g_romfsFile); g_romfsOpen = false; }
         if (!g_romfsOpen)
         {
