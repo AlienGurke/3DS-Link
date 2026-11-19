@@ -1573,6 +1573,79 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
         return sendResponse(fd, h, st, g_outbuf, st == LINK_OK ? outLen : 0);
     }
 
+    case LINK_CMD_ARCWRITE:
+    {
+        /* a part of a file in a save / extdata (the emulator writes a save back) */
+        LinkArcWriteReq req;
+        FS_Archive arch;
+        if (h->len < sizeof(req)) return sendResponse(fd, h, LINK_ERR_BADARGS, NULL, 0);
+        memcpy(&req, payload, sizeof(req));
+        if (req.archive.archive != LINK_ARCHIVE_USER_SAVEDATA && req.archive.archive != LINK_ARCHIVE_EXTDATA)
+            return sendResponse(fd, h, LINK_ERR_DENIED, NULL, 0);   /* saves only */
+        if (h->len != sizeof(req) + req.pathLen + req.archive.length ||
+            (u64)req.archive.offset + req.archive.length > req.fileSize ||
+            !arcPath(payload + sizeof(req), req.pathLen))
+            return sendResponse(fd, h, LINK_ERR_BADARGS, NULL, 0);
+        if (!openLinkArchive(&req.archive, &arch))
+            return sendResponse(fd, h, LINK_ERR_DENIED, &g_arcResult, sizeof(g_arcResult));
+        FS_Path fp = fsMakePath(PATH_UTF16, g_arcPath);
+        if (req.flags & LINK_AW_CREATE)
+        {
+            FSUSER_DeleteFile(arch, fp);   /* not there is fine */
+            if (R_FAILED(g_arcResult = FSUSER_CreateFile(arch, fp, 0, req.fileSize)))
+                return sendResponse(fd, h, LINK_ERR_IO, &g_arcResult, sizeof(g_arcResult));
+        }
+        Handle file;
+        if (R_FAILED(g_arcResult = FSUSER_OpenFile(&file, arch, fp, FS_OPEN_WRITE, 0)))
+            return sendResponse(fd, h, LINK_ERR_NOTFOUND, &g_arcResult, sizeof(g_arcResult));
+        u32 written = 0;
+        uint16_t st = LINK_OK;
+        if (req.archive.length &&
+            (R_FAILED(g_arcResult = FSFILE_Write(file, &written, req.archive.offset,
+                                                 payload + sizeof(req) + req.pathLen,
+                                                 req.archive.length, 0)) ||
+             written != req.archive.length))
+            st = LINK_ERR_IO;
+        FSFILE_Close(file);
+        return sendResponse(fd, h, st, st == LINK_OK ? NULL : &g_arcResult, st == LINK_OK ? 0 : sizeof(g_arcResult));
+    }
+
+    case LINK_CMD_ARCDELETE:
+    case LINK_CMD_ARCMKDIR:
+    case LINK_CMD_ARCCOMMIT:
+    {
+        LinkArchiveReq req;
+        FS_Archive arch;
+        if (h->len < sizeof(req)) return sendResponse(fd, h, LINK_ERR_BADARGS, NULL, 0);
+        memcpy(&req, payload, sizeof(req));
+        if (req.archive != LINK_ARCHIVE_USER_SAVEDATA && req.archive != LINK_ARCHIVE_EXTDATA)
+            return sendResponse(fd, h, LINK_ERR_DENIED, NULL, 0);   /* saves only */
+        if (h->cmd != LINK_CMD_ARCCOMMIT && !arcPath(payload + sizeof(req), h->len - sizeof(req)))
+            return sendResponse(fd, h, LINK_ERR_BADARGS, NULL, 0);
+        if (!openLinkArchive(&req, &arch))
+            return sendResponse(fd, h, LINK_ERR_DENIED, &g_arcResult, sizeof(g_arcResult));
+        FS_Path fp = fsMakePath(PATH_UTF16, g_arcPath);
+        if (h->cmd == LINK_CMD_ARCDELETE)
+            g_arcResult = req.offset ? FSUSER_DeleteDirectoryRecursively(arch, fp) : FSUSER_DeleteFile(arch, fp);
+        else if (h->cmd == LINK_CMD_ARCMKDIR)
+        {
+            Handle d;
+            if (R_SUCCEEDED(FSUSER_OpenDirectory(&d, arch, fp))) { FSDIR_Close(d); g_arcResult = 0; }
+            else g_arcResult = FSUSER_CreateDirectory(arch, fp, 0);
+        }
+        else
+        {
+            /* offset 1: throw the changes away (closing without commit) */
+            g_arcResult = req.archive == LINK_ARCHIVE_USER_SAVEDATA && req.offset == 0
+                ? FSUSER_ControlArchive(arch, ARCHIVE_ACTION_COMMIT_SAVE_DATA, NULL, 0, NULL, 0) : 0;
+            closeLinkArchive();   /* done with this save */
+        }
+        if (R_FAILED(g_arcResult))
+            return sendResponse(fd, h, h->cmd == LINK_CMD_ARCDELETE ? LINK_ERR_NOTFOUND : LINK_ERR_IO,
+                                &g_arcResult, sizeof(g_arcResult));
+        return sendResponse(fd, h, LINK_OK, NULL, 0);
+    }
+
     case LINK_CMD_SYSROMFS:
     {
         /* the RomFS of a system data archive, read through the 3DS's own file system */
