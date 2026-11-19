@@ -994,10 +994,17 @@ static bool g_arcOpen = false;
 static FS_Archive g_arcHandle;
 static LinkArchiveReq g_arcKey;
 
+/* LINK_CMD_SYSROMFS: the RomFS being read stays open until it is done */
+static Handle g_romfsFile;
+static bool g_romfsOpen = false;
+static u64 g_romfsTid = 0;
+
 static void closeLinkArchive(void)
 {
     if (g_arcOpen) FSUSER_CloseArchive(g_arcHandle);
     g_arcOpen = false;
+    if (g_romfsOpen) FSFILE_Close(g_romfsFile);
+    g_romfsOpen = false;
 }
 
 static bool openLinkArchive(const LinkArchiveReq* req, FS_Archive* arch)
@@ -1564,6 +1571,52 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
         FSFILE_Close(file);
         (void)arch;   /* stays open for the next request */
         return sendResponse(fd, h, st, g_outbuf, st == LINK_OK ? outLen : 0);
+    }
+
+    case LINK_CMD_SYSROMFS:
+    {
+        /* the RomFS of a system data archive, read through the 3DS's own file system */
+        u8* raw = arcRawBuffer();
+        LinkRomfsReq req;
+        if (!raw) return sendResponse(fd, h, LINK_ERR_IO, NULL, 0);
+        if (h->len < sizeof(req)) return sendResponse(fd, h, LINK_ERR_BADARGS, NULL, 0);
+        memcpy(&req, payload, sizeof(req));
+        if (g_romfsOpen && g_romfsTid != req.titleId) { FSFILE_Close(g_romfsFile); g_romfsOpen = false; }
+        if (!g_romfsOpen)
+        {
+            u32 archPath[4] = { (u32)req.titleId, (u32)(req.titleId >> 32), req.mediaType, 0 };
+            u32 filePath[5] = { 0, 0, 0, 0, 0 };   /* type 0: RomFS */
+            g_arcResult = FSUSER_OpenFileDirectly(&g_romfsFile, (FS_ArchiveID)0x2345678A,
+                                                  (FS_Path){ PATH_BINARY, sizeof(archPath), archPath },
+                                                  (FS_Path){ PATH_BINARY, sizeof(filePath), filePath },
+                                                  FS_OPEN_READ, 0);
+            if (R_FAILED(g_arcResult))
+                return sendResponse(fd, h, LINK_ERR_NOTFOUND, &g_arcResult, sizeof(g_arcResult));
+            g_romfsOpen = true;
+            g_romfsTid = req.titleId;
+        }
+        u64 size = 0;
+        if (R_FAILED(FSFILE_GetSize(g_romfsFile, &size)) || size > 0xFFFFFFFFull)
+            return sendResponse(fd, h, LINK_ERR_IO, NULL, 0);
+        u32 want = req.length < LINK_ARCZ_MAX_CHUNK ? req.length : LINK_ARCZ_MAX_CHUNK;
+        if ((u64)req.offset >= size) want = 0;
+        else if (req.offset + (u64)want > size) want = (u32)(size - req.offset);
+        u32 got = 0;
+        if (want && (R_FAILED(FSFILE_Read(g_romfsFile, &got, req.offset, raw, want)) || got != want))
+            return sendResponse(fd, h, LINK_ERR_IO, NULL, 0);
+        LinkArcChunk c;
+        memset(&c, 0, sizeof(c));
+        c.totalSize = (u32)size;
+        c.rawLen = want;
+        c.mode = LINK_BLOCK_RAW;
+        u32 outLen;
+        int enc = want ? LZ4_compress_fast_extState(&g_lz4State, (const char*)raw, (char*)g_outbuf + sizeof(c),
+                                                    (int)want, (int)(LINK_MAX_PAYLOAD - sizeof(c)), 1) : 0;
+        if (enc > 0 && (u32)enc < want) { c.mode = LINK_BLOCK_LZ4; outLen = sizeof(c) + (u32)enc; }
+        else { memcpy(g_outbuf + sizeof(c), raw, want); outLen = sizeof(c) + want; }
+        memcpy(g_outbuf, &c, sizeof(c));
+        if (want == 0 || req.offset + want >= size) { FSFILE_Close(g_romfsFile); g_romfsOpen = false; }
+        return sendResponse(fd, h, LINK_OK, g_outbuf, outLen);
     }
 
     case LINK_CMD_ARCLIST:
