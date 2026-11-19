@@ -1466,8 +1466,18 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
     case LINK_CMD_GETTIME:
     {
         /* the clock the games see, so the emulator can run on the same time */
-        u64 t = osGetTime();
-        return sendResponse(fd, h, LINK_OK, &t, sizeof(t));
+        /* plus the user time offset (config block 0x30001: shown time minus the RTC).
+           Games keep the raw RTC (shown time minus this offset) in their saves to spot a
+           changed clock, so the emulator needs the same offset or the save "jumps". */
+        u64 t[2] = { osGetTime(), 0 };
+        size_t n = sizeof(t[0]);
+        if (R_SUCCEEDED(cfguInit()))
+        {
+            if (R_SUCCEEDED(CFGU_GetConfigInfoBlk2(8, 0x00030001, &t[1])))
+                n = sizeof(t);
+            cfguExit();
+        }
+        return sendResponse(fd, h, LINK_OK, t, n);
     }
 
     case LINK_CMD_ARCREAD:
