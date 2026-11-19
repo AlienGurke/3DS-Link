@@ -102,6 +102,7 @@ enum StrId
     S_D_RESTORE_A, S_RESTORING, S_CONFIRM_HINT,
     S_M_SHOTMODE, S_SHOT_BOTH, S_SHOT_TOP, S_SHOT_BOTTOM, S_SHOT_SEPARATE,
     S_M_STATUSBAR, S_BAT, S_WIFI,
+    S_TAB_DS, S_TAB_3DS, S_NO_LIB, S_NEED_MELONDS, S_NEED_AZAHAR, S_ON3DS,
     S_COUNT
 };
 
@@ -109,7 +110,7 @@ static const char* const g_strs[LANG_COUNT][S_COUNT] = {
     {   /* English */
         "melonDS Link", "IP address:", "connected", "waiting...", "Controls:", "active", "Picture:",
         "Display:", "Enlarged", "Original (1:1)", "Pick a game", "No .nds files found.",
-        "A start  X favorite  Y reload", "A start  X favorite  Y reload  B back", "Running:",
+        "A start  X fav  Y reload  L/R tab", "A start  X fav  Y reload  L/R tab  B back", "Running:",
         "SELECT+START: menu   L+R+SELECT+START hold: quit", "C-stick: down = games, up = display",
         "In melonDS: 3DS Link > Connect to 3DS", "melonDS Link menu", "Game list", "Display",
         "Turn top screen off", "Screenshot (saved on the PC)", "Language", "Back to the game", "Quit the app",
@@ -128,11 +129,14 @@ static const char* const g_strs[LANG_COUNT][S_COUNT] = {
         "L+R+A confirm   B back",
         "Screenshot shows", "both screens", "top screen", "bottom screen", "both, separate files",
         "Battery/WiFi at the top", "Battery", "WiFi",
+        "DS - melonDS", "3DS - Azahar", "No games in Azahar's game list.",
+        "To start a DS game: connect melonDS", "To start a 3DS game: connect Azahar",
+        "3DS = also installed on this 3DS",
     },
     {   /* Deutsch */
         "melonDS Link", "IP-Adresse:", "verbunden", "wartet...", "Steuerung:", "aktiv", "Bild:",
         "Anzeige:", "Vergrößert", "Original (1:1)", "Spiel wählen", "Keine .nds-Dateien gefunden.",
-        "A Start  X Favorit  Y neu laden", "A Start  X Favorit  Y neu laden  B zurück", "Läuft:",
+        "A Start  X Favorit  Y neu  L/R Tab", "A Start  X Favorit  Y neu  L/R Tab  B zurück", "Läuft:",
         "SELECT+START: Menü   L+R+SELECT+START halten: Ende", "C-Stick: runter = Spiele, hoch = Anzeige",
         "In melonDS: 3DS Link > Mit 3DS verbinden", "melonDS-Link-Menü", "Spieleliste", "Anzeige",
         "Oberen Bildschirm ausschalten", "Screenshot (wird am PC gespeichert)", "Sprache",
@@ -152,6 +156,9 @@ static const char* const g_strs[LANG_COUNT][S_COUNT] = {
         "L+R+A bestätigen   B zurück",
         "Screenshot zeigt", "beide Bildschirme", "oberen Bildschirm", "unteren Bildschirm", "beide, eigene Dateien",
         "Akku/WLAN oben anzeigen", "Akku", "WLAN",
+        "DS - melonDS", "3DS - Azahar", "Keine Spiele in Azahars Spieleliste.",
+        "Für DS-Spiele: melonDS verbinden", "Für 3DS-Spiele: Azahar verbinden",
+        "3DS = auch auf diesem 3DS installiert",
     },
 };
 static char g_tr[S_COUNT][80];   /* current language, already in code page 437 */
@@ -172,6 +179,7 @@ static const char* const g_strKeys[S_COUNT] = {
     "restore_note_running", "restore_confirm", "restoring", "confirm_hint",
     "menu_shotmode", "shot_both", "shot_top", "shot_bottom", "shot_separate",
     "menu_statusbar", "battery", "wifi",
+    "tab_ds", "tab_3ds", "no_library", "need_melonds", "need_azahar", "on_3ds",
 };
 /* the files carry a fingerprint of the built-in texts: when an app update
    changes a text, they are written anew (so the change shows up) */
@@ -431,6 +439,7 @@ static char g_currentGame[128] = "";
 enum { LA_NONE, LA_RESUME, LA_SWITCH, LA_STOP, LA_QUIT, LA_RESTORE };
 static volatile int g_localAsk = LA_NONE;
 static int g_switchIdx = 0;                      /* LA_SWITCH: the game to start */
+static int g_switchTab = 0;                      /* ... in this tab */
 static volatile bool g_launchPending = false;    /* picked a game, melonDS has not answered yet */
 static volatile bool g_sessionNew = false;       /* melonDS runs a game we did not know about */
 static volatile bool g_sessionSame = false;      /* melonDS confirmed the game we play */
@@ -495,6 +504,17 @@ static char* g_onPcBuf = NULL;
 static char* g_onPc[MAX_ONPC];
 static int g_onPcCount = 0;
 static volatile u32 g_onPcVersion = 0;   /* changes whenever the set changes */
+
+/* 3DS games: Azahar's game list (LINK_CMD_LIBRARY). The server thread only hands the
+   text over (g_libPending); the main loop parses, marks and sorts it. */
+#define MAX_LIB 512
+typedef struct { const char* path; const char* name; u64 tid; bool on3ds; } LibGame;
+static char* g_libPending = NULL;    /* new list from Azahar (g_lock) */
+static char* g_libBuf = NULL;        /* the text g_lib points into (main thread) */
+static LibGame g_lib[MAX_LIB];
+static int g_libCount = 0;
+static int g_tab = 0;                /* game list tab: 0 DS (melonDS), 1 3DS (Azahar) */
+static bool g_haveLibReqEv = false;  /* Y on the 3DS tab: Azahar sends its list anew */
 
 static bool isOnPcLocked(const char* name)
 {
@@ -636,6 +656,101 @@ static void requestLaunch(int idx)
     snprintf(g_statusText, sizeof(g_statusText), "%s", T(S_STARTING));
     LightLock_Unlock(&g_lock);
 
+    g_gameStarted = true;
+    g_launchPending = true;
+    g_menuOpen = false;
+}
+
+/* the favourites key of a 3DS game */
+static void libFavKey(const LibGame* g, char* out, size_t size)
+{
+    if (g->tid) snprintf(out, size, "3DS:%016llX", (unsigned long long)g->tid);
+    else snprintf(out, size, "3DS:%.200s", g->name);
+}
+
+static bool libIsFav(const LibGame* g)
+{
+    char k[220];
+    libFavKey(g, k, sizeof(k));
+    return isFav(k);
+}
+
+static int cmpLib(const void* a, const void* b)
+{
+    const LibGame* x = (const LibGame*)a;
+    const LibGame* y = (const LibGame*)b;
+    bool fx = libIsFav(x), fy = libIsFav(y);
+    if (fx != fy) return fx ? -1 : 1;
+    return strcasecmp(x->name, y->name);
+}
+
+static int findLib(const char* path)
+{
+    for (int i = 0; i < g_libCount; i++)
+        if (strcmp(g_lib[i].path, path) == 0) return i;
+    return -1;
+}
+
+/* a new list from Azahar: lines "title id (hex) TAB path TAB name" */
+static void takeLibrary(char* text)
+{
+    free(g_libBuf);
+    g_libBuf = text;
+    g_libCount = 0;
+    for (char* p = text; p && *p && g_libCount < MAX_LIB; )
+    {
+        char* nl = strchr(p, '\n');
+        if (nl) *nl = '\0';
+        char* t1 = strchr(p, '\t');
+        char* t2 = t1 ? strchr(t1 + 1, '\t') : NULL;
+        if (t1 && t2)
+        {
+            *t1 = *t2 = '\0';
+            LibGame* g = &g_lib[g_libCount++];
+            g->tid = strtoull(p, NULL, 16);
+            g->path = t1 + 1;
+            g->name = t2[1] ? t2 + 1 : t1 + 1;
+            g->on3ds = false;
+        }
+        p = nl ? nl + 1 : NULL;
+    }
+    /* which of them are installed here (their save can come from this 3DS) */
+    if (g_libCount && R_SUCCEEDED(amInit()))
+    {
+        const FS_MediaType media[2] = { MEDIATYPE_SD, MEDIATYPE_GAME_CARD };
+        static u64 ids[1024];
+        for (int m = 0; m < 2; m++)
+        {
+            u32 count = 0, read = 0;
+            if (R_FAILED(AM_GetTitleCount(media[m], &count))) continue;
+            if (count > 1024) count = 1024;
+            if (count && R_FAILED(AM_GetTitleList(&read, media[m], count, ids))) read = 0;
+            for (u32 j = 0; j < read; j++)
+                for (int i = 0; i < g_libCount; i++)
+                    if (g_lib[i].tid == ids[j]) g_lib[i].on3ds = true;
+        }
+        amExit();
+    }
+    qsort(g_lib, g_libCount, sizeof(LibGame), cmpLib);
+}
+
+/* the user picked a 3DS game: Azahar starts it (path from its own game list) */
+static void requestLaunchLib(int idx)
+{
+    if (idx < 0 || idx >= g_libCount) return;
+    const LibGame* g = &g_lib[idx];
+    LightLock_Lock(&g_lock);
+    memset(&g_event, 0, sizeof(g_event));
+    g_event.type = LINK_EVENT_LAUNCH;
+    g_event.romSize = g->tid;
+    snprintf(g_eventRom, sizeof(g_eventRom), "%s", g->path);
+    g_eventSave[0] = 0;
+    g_event.romPathLen = (uint16_t)strlen(g_eventRom);
+    g_event.savePathLen = 0;
+    g_haveEvent = true;
+    snprintf(g_currentGame, sizeof(g_currentGame), "%.120s", g->name);
+    snprintf(g_statusText, sizeof(g_statusText), "%s", T(S_STARTING));
+    LightLock_Unlock(&g_lock);
     g_gameStarted = true;
     g_launchPending = true;
     g_menuOpen = false;
@@ -1226,7 +1341,7 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
             g_haveEvent = false;
         }
         else if (g_haveAnswer || g_haveShot || g_haveLangEvent || g_haveStopEv || g_haveResumeEv || g_haveVideoEv ||
-                 g_haveBakReqEv || g_haveRestoreEv)
+                 g_haveBakReqEv || g_haveRestoreEv || g_haveLibReqEv)
         {
             LinkEvent ev;
             memset(&ev, 0, sizeof(ev));
@@ -1247,6 +1362,7 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
                 g_haveVideoEv = false;
             }
             else if (g_haveResumeEv) { ev.type = LINK_EVENT_RESUME; g_haveResumeEv = false; }
+            else if (g_haveLibReqEv) { ev.type = LINK_EVENT_LIBRARY; g_haveLibReqEv = false; }
             else if (g_haveBakReqEv || g_haveRestoreEv)
             {
                 if (g_haveRestoreEv)
@@ -1471,16 +1587,25 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
         /* plus the user time offset (config block 0x30001: shown time minus the RTC).
            Games keep the raw RTC (shown time minus this offset) in their saves to spot a
            changed clock, so the emulator needs the same offset or the save "jumps". */
-        u64 t[3] = { osGetTime(), 0, 0 };
-        size_t n = sizeof(t[0]);
+        /* then, for finding out what the clock values mean (LINK_TIME_UNKNOWN where not
+           readable): the raw RTC from the MCU registers, the RTC as the system (PTM)
+           reads it, and config block 0x30002 */
+        u64 t[5] = { osGetTime(), LINK_TIME_UNKNOWN, LINK_TIME_UNKNOWN, LINK_TIME_UNKNOWN, LINK_TIME_UNKNOWN };
         if (R_SUCCEEDED(cfguInit()))
         {
-            if (R_SUCCEEDED(CFGU_GetConfigInfoBlk2(8, 0x00030001, &t[1])))
-                n = 2 * sizeof(t[0]);
+            u64 v = 0;
+            if (R_SUCCEEDED(CFGU_GetConfigInfoBlk2(8, 0x00030001, &v))) t[1] = v;
+            if (R_SUCCEEDED(CFG_GetConfigInfoBlk8(8, 0x00030002, &v))) t[4] = v;
             cfguExit();
         }
-        if (n == 2 * sizeof(t[0]) && readRawRtc(&t[2]))   /* for the log: what the RTC says */
-            n = sizeof(t);
+        if (!readRawRtc(&t[2])) t[2] = LINK_TIME_UNKNOWN;
+        if (R_SUCCEEDED(ptmSysmInit()))
+        {
+            s64 y2k = 0;
+            if (R_SUCCEEDED(PTMSYSM_GetRtcTime(&y2k))) t[3] = (u64)(y2k + 3155673600000LL);   /* 1900 -> 2000 */
+            ptmSysmExit();
+        }
+        size_t n = sizeof(t);
         return sendResponse(fd, h, LINK_OK, t, n);
     }
 
@@ -1857,6 +1982,20 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
             int b = (int)t.sndbuf;
             setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &b, sizeof(b));
         }
+        return sendResponse(fd, h, LINK_OK, NULL, 0);
+    }
+
+    case LINK_CMD_LIBRARY:
+    {
+        /* Azahar's game list for the 3DS tab */
+        char* buf = (char*)malloc(h->len + 1);
+        if (!buf) return sendResponse(fd, h, LINK_ERR_IO, NULL, 0);
+        memcpy(buf, payload, h->len);
+        buf[h->len] = '\0';
+        LightLock_Lock(&g_lock);
+        free(g_libPending);
+        g_libPending = buf;
+        LightLock_Unlock(&g_lock);
         return sendResponse(fd, h, LINK_OK, NULL, 0);
     }
 
@@ -2962,6 +3101,9 @@ int main(int argc, char** argv)
     bool isNew3DS = false;
     APT_CheckNew3DS(&isNew3DS);
     if (g_lastGame[0]) { int i = findGame(g_lastGame); if (i >= 0) menuCursor = i; }
+    g_tab = NATIVE() ? 1 : 0;
+    int tabCursor[2] = { menuCursor, 0 }, tabTop[2] = { 0, 0 };
+    if (g_tab == 1) { menuCursor = 0; }
     const int LIST_ROWS = 14;
     int redrawBoth = 2;
 
@@ -2980,9 +3122,35 @@ int main(int argc, char** argv)
             applyLanguage();
             saveConfig();
             redrawBoth = 2;
+            /* the list shows the games of the emulator that is connected */
+            int want = NATIVE() ? 1 : 0;
+            if (want != g_tab)
+            {
+                tabCursor[g_tab] = menuCursor; tabTop[g_tab] = menuTop;
+                g_tab = want;
+                menuCursor = tabCursor[g_tab]; menuTop = tabTop[g_tab];
+            }
+            if (!g_gameStarted && !g_linkMenuOpen) g_menuOpen = true;
         }
         bool native = NATIVE();
-        if (native && g_menuOpen) g_menuOpen = false;   /* no game list for 3DS games */
+
+        /* a new game list from Azahar */
+        {
+            LightLock_Lock(&g_lock);
+            char* lib = g_libPending;
+            g_libPending = NULL;
+            LightLock_Unlock(&g_lock);
+            if (lib)
+            {
+                char keep[LINK_MAX_PATH] = "";
+                if (menuCursor >= 0 && g_tab == 1 && menuCursor < g_libCount) snprintf(keep, sizeof(keep), "%s", g_lib[menuCursor].path);
+                takeLibrary(lib);
+                int i = keep[0] ? findLib(keep) : -1;
+                if (g_tab == 1) menuCursor = i >= 0 ? i : (menuCursor < g_libCount ? menuCursor : 0);
+                else tabCursor[1] = 0;
+            }
+        }
+        int listCount = g_tab == 1 ? g_libCount : g_gameCount;
 
         bool haveVideo = g_lastVideoTime != 0 && osGetTime() - g_lastVideoTime < 3000;
         bool zoom = g_zoom;
@@ -3028,7 +3196,7 @@ int main(int argc, char** argv)
         {
             g_sessionEnded = false;
             if (g_localAsk == LA_RESUME || g_localAsk == LA_STOP || g_localAsk == LA_SWITCH) g_localAsk = LA_NONE;
-            if (!g_linkMenuOpen && !native) g_menuOpen = true;
+            if (!g_linkMenuOpen) g_menuOpen = true;
         }
         /* a save that never got swapped in (connection lost) does not block quitting forever */
         if (g_saveWriting && osGetTime() - g_saveWriteTime > 15000) g_saveWriting = false;
@@ -3052,7 +3220,7 @@ int main(int argc, char** argv)
                 if (g_linkMenuOpen)
                 {
                     g_linkMenuOpen = false;
-                    if (!g_gameStarted && !native) g_menuOpen = true;
+                    if (!g_gameStarted) g_menuOpen = true;
                 }
                 else
                 {
@@ -3130,8 +3298,8 @@ int main(int argc, char** argv)
         enum { MI_BACK, MI_GAMES, MI_SHOT, MI_SHOTMODE, MI_BACKUPS, MI_DISPLAY, MI_BOTTOM, MI_TOPOFF, MI_STATUSBAR, MI_LANG, MI_STOP, MI_QUIT };
         int items[12], itemCount = 0;
         bool playing = g_gameStarted && !g_launchPending;
-        if (g_gameStarted || native) items[itemCount++] = MI_BACK;
-        if (!native) items[itemCount++] = MI_GAMES;
+        if (g_gameStarted) items[itemCount++] = MI_BACK;
+        items[itemCount++] = MI_GAMES;
         if (playing && g_tcpConnected && !native) items[itemCount++] = MI_SHOT;
         if (!native) items[itemCount++] = MI_SHOTMODE;
         /* backups: of the running game, else of the game selected in the list */
@@ -3144,20 +3312,20 @@ int main(int argc, char** argv)
                 if (l > 4 && strlen(g_currentGame) == l - 4 && strncmp(g_games[i], g_currentGame, l - 4) == 0) bakGame = i;
             }
         }
-        else if (menuCursor >= 0 && menuCursor < g_gameCount) bakGame = menuCursor;
+        else if (g_tab == 0 && menuCursor >= 0 && menuCursor < g_gameCount) bakGame = menuCursor;
         if (bakGame >= 0 && g_tcpConnected && !g_launchPending && !native) items[itemCount++] = MI_BACKUPS;
         if (!native) items[itemCount++] = MI_DISPLAY;
         items[itemCount++] = MI_BOTTOM;
         items[itemCount++] = MI_TOPOFF;
         items[itemCount++] = MI_STATUSBAR;
         items[itemCount++] = MI_LANG;
-        if (playing && g_tcpConnected && !native) items[itemCount++] = MI_STOP;
+        if (playing && g_tcpConnected) items[itemCount++] = MI_STOP;
         items[itemCount++] = MI_QUIT;
         if (linkCursor >= itemCount) linkCursor = itemCount - 1;
         if (linkCursor < 0) linkCursor = 0;
 
         /* back to the game if there is one, else to the game list */
-        #define CLOSE_MENU() do { g_linkMenuOpen = false; if (!g_gameStarted && !native) g_menuOpen = true; } while (0)
+        #define CLOSE_MENU() do { g_linkMenuOpen = false; if (!g_gameStarted) g_menuOpen = true; } while (0)
 
         if (askActive && mk)
         {
@@ -3186,7 +3354,8 @@ int main(int argc, char** argv)
                     else g_menuOpen = true;
                     break;
                 case LA_SWITCH:
-                    if (yes) { requestLaunch(g_switchIdx); saveConfig(); }
+                    if (yes && g_switchTab == 1) requestLaunchLib(g_switchIdx);
+                    else if (yes) { requestLaunch(g_switchIdx); saveConfig(); }
                     break;
                 case LA_STOP:
                     if (yes)
@@ -3297,13 +3466,22 @@ int main(int argc, char** argv)
         }
         else if (g_menuOpen && mk)
         {
+            if (mk & (KEY_L | KEY_R))
+            {
+                /* the other tab */
+                tabCursor[g_tab] = menuCursor; tabTop[g_tab] = menuTop;
+                g_tab ^= 1;
+                menuCursor = tabCursor[g_tab]; menuTop = tabTop[g_tab];
+                listCount = g_tab == 1 ? g_libCount : g_gameCount;
+                mk &= ~(KEY_A | KEY_X | KEY_Y);
+            }
             if (mk & (KEY_DUP | KEY_CPAD_UP)) menuCursor--;
             if (mk & (KEY_DDOWN | KEY_CPAD_DOWN)) menuCursor++;
-            if (mk & (KEY_DLEFT | KEY_L)) menuCursor -= LIST_ROWS;
-            if (mk & (KEY_DRIGHT | KEY_R)) menuCursor += LIST_ROWS;
-            if (menuCursor >= g_gameCount) menuCursor = g_gameCount - 1;
+            if (mk & KEY_DLEFT) menuCursor -= LIST_ROWS;
+            if (mk & KEY_DRIGHT) menuCursor += LIST_ROWS;
+            if (menuCursor >= listCount) menuCursor = listCount - 1;
             if (menuCursor < 0) menuCursor = 0;
-            if ((mk & (KEY_X | KEY_Y)) && g_gameCount > 0)
+            if (g_tab == 0 && (mk & (KEY_X | KEY_Y)) && g_gameCount > 0)
             {
                 char keep[256];
                 snprintf(keep, sizeof(keep), "%s", g_games[menuCursor]);
@@ -3312,13 +3490,40 @@ int main(int argc, char** argv)
                 int i = findGame(keep);
                 if (i >= 0) menuCursor = i;
             }
-            if ((mk & KEY_A) && g_gameCount > 0)
+            if (g_tab == 1 && (mk & KEY_X) && g_libCount > 0)
+            {
+                char key[220], keep[LINK_MAX_PATH];
+                libFavKey(&g_lib[menuCursor], key, sizeof(key));
+                snprintf(keep, sizeof(keep), "%s", g_lib[menuCursor].path);
+                toggleFav(key);
+                qsort(g_lib, g_libCount, sizeof(LibGame), cmpLib);
+                int i = findLib(keep);
+                if (i >= 0) menuCursor = i;
+            }
+            if (g_tab == 1 && (mk & KEY_Y) && native && g_tcpConnected)
+            {
+                LightLock_Lock(&g_lock);
+                g_haveLibReqEv = true;   /* Azahar sends its list again */
+                LightLock_Unlock(&g_lock);
+            }
+            if ((mk & KEY_A) && listCount > 0)
             {
                 char base[256];
-                snprintf(base, sizeof(base), "%s", g_games[menuCursor]);
-                size_t bl = strlen(base);
-                if (bl > 4) base[bl - 4] = 0;
-                if (g_gameStarted && strcmp(base, g_currentGame) == 0)
+                if (g_tab == 1) snprintf(base, sizeof(base), "%s", g_lib[menuCursor].name);
+                else
+                {
+                    snprintf(base, sizeof(base), "%s", g_games[menuCursor]);
+                    size_t bl = strlen(base);
+                    if (bl > 4) base[bl - 4] = 0;
+                }
+                if ((g_tab == 1) != native)
+                {
+                    /* the other emulator is connected: it cannot start this game */
+                    LightLock_Lock(&g_lock);
+                    snprintf(g_statusText, sizeof(g_statusText), "%s", T(g_tab == 1 ? S_NEED_AZAHAR : S_NEED_MELONDS));
+                    LightLock_Unlock(&g_lock);
+                }
+                else if (g_gameStarted && strcmp(base, g_currentGame) == 0)
                 {
                     /* the game that runs anyway: just go back to it, never restart it */
                     g_menuOpen = false;
@@ -3328,8 +3533,10 @@ int main(int argc, char** argv)
                 {
                     /* another game while one runs: unsaved progress would be lost */
                     g_switchIdx = menuCursor;
+                    g_switchTab = g_tab;
                     g_localAsk = LA_SWITCH;
                 }
+                else if (g_tab == 1) requestLaunchLib(menuCursor);
                 else
                 {
                     requestLaunch(menuCursor);
@@ -3404,8 +3611,13 @@ int main(int argc, char** argv)
                     snprintf(b, sizeof(b), "%s", T(S_D_LIST));
                     break;
                 case LA_SWITCH:
-                    utf8ToCp437(other, sizeof(other), g_switchIdx < g_gameCount ? g_games[g_switchIdx] : "");
-                    if (strlen(other) > 4) other[strlen(other) - 4] = 0;
+                    if (g_switchTab == 1)
+                        utf8ToCp437(other, sizeof(other), g_switchIdx < g_libCount ? g_lib[g_switchIdx].name : "");
+                    else
+                    {
+                        utf8ToCp437(other, sizeof(other), g_switchIdx < g_gameCount ? g_games[g_switchIdx] : "");
+                        if (strlen(other) > 4) other[strlen(other) - 4] = 0;
+                    }
                     snprintf(lines[count++], 52, "%s", T(S_D_SWITCH_T));
                     snprintf(lines[count++], 52, "%s %.40s", T(S_RUNNING), g);
                     snprintf(lines[count++], 52, "%.49s", T(S_D_LOST));
@@ -3512,40 +3724,61 @@ int main(int argc, char** argv)
         }
         else if (g_menuOpen)
         {
-            setLine(10, "\x1b[36m%s\x1b[0m (%d - %.30s)", T(S_PICK_GAME), g_gameCount, g_romDir);
+            /* the tabs: DS games (melonDS) and 3DS games (Azahar) */
+            if (g_tab == 0)
+                setLine(10, "\x1b[46;30m %s \x1b[0m \x1b[90m%s\x1b[0m  %d", T(S_TAB_DS), T(S_TAB_3DS), g_gameCount);
+            else
+                setLine(10, "\x1b[90m%s\x1b[0m \x1b[46;30m %s \x1b[0m  %d", T(S_TAB_DS), T(S_TAB_3DS), g_libCount);
             if (menuCursor < menuTop) menuTop = menuCursor;
             if (menuCursor >= menuTop + LIST_ROWS) menuTop = menuCursor - LIST_ROWS + 1;
+            if (menuTop < 0) menuTop = 0;
             for (int r = 0; r < LIST_ROWS; r++)
             {
                 int i = menuTop + r;
-                if (i < g_gameCount)
+                if (i < listCount)
                 {
                     char name[300];
-                    utf8ToCp437(name, sizeof(name), g_games[i]);
+                    bool fav, mark;
+                    const char* markText;
+                    if (g_tab == 1)
+                    {
+                        utf8ToCp437(name, sizeof(name), g_lib[i].name);
+                        fav = libIsFav(&g_lib[i]);
+                        mark = g_lib[i].on3ds;
+                        markText = " 3DS";
+                    }
+                    else
+                    {
+                        utf8ToCp437(name, sizeof(name), g_games[i]);
+                        size_t n0 = strlen(name);
+                        if (n0 > 4 && strcasecmp(name + n0 - 4, ".nds") == 0) name[n0 - 4] = '\0';
+                        fav = isFav(g_games[i]);
+                        LightLock_Lock(&g_lock);
+                        mark = isOnPcLocked(g_games[i]);
+                        LightLock_Unlock(&g_lock);
+                        markText = " PC";
+                    }
                     size_t n = strlen(name);
-                    if (n > 4 && strcasecmp(name + n - 4, ".nds") == 0) name[n -= 4] = '\0';
-                    bool fav = isFav(g_games[i]);
-                    LightLock_Lock(&g_lock);
-                    bool pc = isOnPcLocked(g_games[i]);
-                    LightLock_Unlock(&g_lock);
                     const char* shown = name;
-                    if (i == menuCursor && n > 44)
+                    if (i == menuCursor && n > 43)
                     {
                         /* too long: the selected name scrolls (pauses at both ends) */
-                        int steps = (int)(n - 44);
+                        int steps = (int)(n - 43);
                         int t = (int)((osGetTime() / 200) % (u64)(steps + 12));
                         int off = t < 6 ? 0 : t < 6 + steps ? t - 6 : steps;
                         shown = name + off;
                     }
-                    if (i == menuCursor) setLine(11 + r, "\x1b[47;30m>%c%-44.44s%s", fav ? '*' : ' ', shown, pc ? " PC" : "   ");
-                    else if (fav) setLine(11 + r, "\x1b[33m*\x1b[0m %-44.44s\x1b[32m%s", shown, pc ? " PC" : "");
-                    else setLine(11 + r, "  %-44.44s\x1b[32m%s", shown, pc ? " PC" : "");
+                    if (i == menuCursor) setLine(11 + r, "\x1b[47;30m>%c%-43.43s%-4s", fav ? '*' : ' ', shown, mark ? markText : "");
+                    else if (fav) setLine(11 + r, "\x1b[33m*\x1b[0m %-43.43s\x1b[32m%s", shown, mark ? markText : "");
+                    else setLine(11 + r, "  %-43.43s\x1b[32m%s", shown, mark ? markText : "");
                 }
-                else if (r == 0 && g_gameCount == 0)
-                    setLine(11 + r, "\x1b[31m  %s", T(S_NO_GAMES));
+                else if (r == 0 && listCount == 0)
+                    setLine(11 + r, "\x1b[31m  %s", T(g_tab == 1 ? S_NO_LIB : S_NO_GAMES));
                 else setLine(11 + r, "");
             }
-            setLine(25, "\x1b[32m%s", T(S_PC_COPIED));
+            if ((g_tab == 1) != native || !g_tcpConnected)
+                setLine(25, "\x1b[33m%s", T(g_tab == 1 ? S_NEED_AZAHAR : S_NEED_MELONDS));
+            else setLine(25, "\x1b[32m%s", T(g_tab == 1 ? S_ON3DS : S_PC_COPIED));
             setLine(26, "\x1b[90m%s", g_gameStarted ? T(S_LIST_HINT_BACK) : T(S_LIST_HINT));
         }
         else
