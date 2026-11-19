@@ -30,6 +30,8 @@
 #define SOC_ALIGN       0x1000
 #define SOC_BUFFERSIZE  0x100000
 
+static bool readRawRtc(u64* ms);
+
 /* ------------------------------------------------------------------ */
 /* shared state between main thread and server thread                  */
 
@@ -1469,14 +1471,16 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
         /* plus the user time offset (config block 0x30001: shown time minus the RTC).
            Games keep the raw RTC (shown time minus this offset) in their saves to spot a
            changed clock, so the emulator needs the same offset or the save "jumps". */
-        u64 t[2] = { osGetTime(), 0 };
+        u64 t[3] = { osGetTime(), 0, 0 };
         size_t n = sizeof(t[0]);
         if (R_SUCCEEDED(cfguInit()))
         {
             if (R_SUCCEEDED(CFGU_GetConfigInfoBlk2(8, 0x00030001, &t[1])))
-                n = sizeof(t);
+                n = 2 * sizeof(t[0]);
             cfguExit();
         }
+        if (n == 2 * sizeof(t[0]) && readRawRtc(&t[2]))   /* for the log: what the RTC says */
+            n = sizeof(t);
         return sendResponse(fd, h, LINK_OK, t, n);
     }
 
@@ -2800,6 +2804,39 @@ static void saveConfig(void)
 }
 
 /* ------------------------------------------------------------------ */
+
+/* days from 1900-01-01 to a date (proleptic Gregorian) */
+static s64 daysSince1900(int y, int m, int d)
+{
+    y -= m <= 2;
+    const s64 era = (y >= 0 ? y : y - 399) / 400;
+    const unsigned yoe = (unsigned)(y - era * 400);
+    const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + (s64)doe - 719468 + 25567;   /* 1970 -> 1900 */
+}
+
+/* the raw hardware clock (MCU registers 0x30..0x36, BCD: s, min, h, weekday, day,
+   month, year since 2000) in milliseconds since 1900, like osGetTime */
+static bool readRawRtc(u64* ms)
+{
+    u8 r[7];
+    bool ok = false;
+    if (R_SUCCEEDED(mcuHwcInit()))
+    {
+        ok = R_SUCCEEDED(MCUHWC_ReadRegister(0x30, r, sizeof(r)));
+        mcuHwcExit();
+    }
+    if (!ok) return false;
+#define BCD(x) (((x) >> 4) * 10 + ((x) & 15))
+    const int sec = BCD(r[0] & 0x7F), min = BCD(r[1] & 0x7F), hour = BCD(r[2] & 0x3F);
+    const int day = BCD(r[4] & 0x3F), mon = BCD(r[5] & 0x1F), year = 2000 + BCD(r[6]);
+#undef BCD
+    if (mon < 1 || mon > 12 || day < 1 || day > 31 || hour > 23 || min > 59 || sec > 59)
+        return false;
+    *ms = (u64)(((daysSince1900(year, mon, day) * 24 + hour) * 60 + min) * 60 + sec) * 1000;
+    return true;
+}
 
 /* battery, charging, WiFi and the lid. The services are only opened for the
    moment of asking (see lcdBacklight). */
