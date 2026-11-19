@@ -1636,13 +1636,38 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
         else
         {
             /* offset 1: throw the changes away (closing without commit) */
-            g_arcResult = req.archive == LINK_ARCHIVE_USER_SAVEDATA && req.offset == 0
+            bool commit = req.archive == LINK_ARCHIVE_USER_SAVEDATA && req.offset == 0;
+            g_arcResult = commit
                 ? FSUSER_ControlArchive(arch, ARCHIVE_ACTION_COMMIT_SAVE_DATA, NULL, 0, NULL, 0) : 0;
             closeLinkArchive();   /* done with this save */
+            if (commit && R_SUCCEEDED(g_arcResult) && req.mediaType == LINK_MEDIA_SD)
+            {
+                /* Games on the SD card keep a "secure value" of their save in the system;
+                   a save written from outside does not match it, and the game calls the
+                   save damaged. Deleting it (as save managers like Checkpoint do after a
+                   restore) makes the game take the save as it is. */
+                u8 out = 0;
+                u64 secureValue = ((u64)SECUREVALUE_SLOT_SD << 32) | ((u64)((req.lowId >> 8) & 0xFFFFF) << 8);
+                FSUSER_ControlSecureSave(SECURESAVE_ACTION_DELETE, &secureValue, 8, &out, 1);
+            }
         }
         if (R_FAILED(g_arcResult))
             return sendResponse(fd, h, h->cmd == LINK_CMD_ARCDELETE ? LINK_ERR_NOTFOUND : LINK_ERR_IO,
                                 &g_arcResult, sizeof(g_arcResult));
+        return sendResponse(fd, h, LINK_OK, NULL, 0);
+    }
+
+    case LINK_CMD_SECUREDEL:
+    {
+        LinkArchiveReq req;
+        if (h->len < sizeof(req)) return sendResponse(fd, h, LINK_ERR_BADARGS, NULL, 0);
+        memcpy(&req, payload, sizeof(req));
+        if (req.archive != LINK_ARCHIVE_USER_SAVEDATA || req.mediaType != LINK_MEDIA_SD)
+            return sendResponse(fd, h, LINK_ERR_DENIED, NULL, 0);
+        u8 out = 0;
+        u64 secureValue = ((u64)SECUREVALUE_SLOT_SD << 32) | ((u64)((req.lowId >> 8) & 0xFFFFF) << 8);
+        g_arcResult = FSUSER_ControlSecureSave(SECURESAVE_ACTION_DELETE, &secureValue, 8, &out, 1);
+        if (R_FAILED(g_arcResult)) return sendResponse(fd, h, LINK_ERR_IO, &g_arcResult, sizeof(g_arcResult));
         return sendResponse(fd, h, LINK_OK, NULL, 0);
     }
 
