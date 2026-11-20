@@ -2507,6 +2507,40 @@ static bool h264Decode(u32 size)
     return true;
 }
 
+static u8 g_h264Par[2][LINK_H264_PART];
+static bool g_h264ParHave[2];
+static int g_h264Groups = 0;          /* from a parity packet (0 = none seen) */
+static u32 g_h264LastLen = 0, g_h264SeqBase = 0;
+static bool g_h264SeqKnown = false;
+static volatile u32 g_h264Repaired = 0;
+
+/* one packet missing in a parity group: rebuild it from the parity */
+static void h264Repair(void)
+{
+    if (g_h264Groups <= 0 || g_h264Total <= 0) return;
+    for (int g = 0; g < g_h264Groups; g++)
+    {
+        if (!g_h264ParHave[g]) continue;
+        int missing = -1, count = 0;
+        for (int i = g; i < g_h264Total; i += g_h264Groups)
+            if (!g_h264Have[i]) { missing = i; count++; }
+        if (count != 1) continue;
+        u8* dst = g_h264Buf + missing * LINK_H264_PART;
+        memcpy(dst, g_h264Par[g], LINK_H264_PART);
+        for (int i = g; i < g_h264Total; i += g_h264Groups)
+        {
+            if (i == missing) continue;
+            const u8* src = g_h264Buf + i * LINK_H264_PART;
+            for (int k = 0; k < LINK_H264_PART; k++) dst[k] ^= src[k];
+        }
+        g_h264Have[missing] = 1;
+        g_h264Got++;
+        g_h264Repaired++;
+        if (missing == g_h264Total - 1) g_h264Size = (u32)missing * LINK_H264_PART + g_h264LastLen;
+        if (g_h264SeqKnown) noteVideoSeq(g_h264SeqBase + (u32)missing);   /* as if it arrived */
+    }
+}
+
 static void h264Packet(const LinkFramePacket* fp, const u8* data, size_t avail)
 {
     if (g_h264Open || g_h264Frame != 0)
@@ -2524,27 +2558,53 @@ static void h264Packet(const LinkFramePacket* fp, const u8* data, size_t avail)
         g_h264Frame = fp->frameId;
         g_h264Open = true;
         memset(g_h264Have, 0, sizeof(g_h264Have));
+        g_h264ParHave[0] = g_h264ParHave[1] = false;
+        g_h264Groups = 0;
         g_h264Got = 0;
         g_h264Total = -1;
         g_h264Size = 0;
+        g_h264SeqKnown = false;
         g_h264Key = (fp->flags & LINK_FRAME_KEY) != 0;
     }
     if (!g_h264Open) return;   /* this frame is done already */
     u32 idx = (fp->flags & 0x7FFF) >> LINK_FRAME_INDEX_SHIFT;
     u32 len = fp->entryCount;
-    if (idx >= H264_MAX_PARTS || len > avail || len > LINK_H264_PART) return;
-    if (!g_h264Have[idx])
+    if (fp->baseSeq & LINK_H264_PARITY)
     {
-        memcpy(g_h264Buf + idx * LINK_H264_PART, data, len);
-        g_h264Have[idx] = 1;
-        g_h264Got++;
+        /* a parity packet */
+        int parts = (int)((fp->baseSeq >> 8) & 0xFFFF);
+        int groups = (int)((fp->baseSeq >> 4) & 0xF);
+        int g = (int)(fp->baseSeq & 0xF);
+        if (parts <= 0 || parts > H264_MAX_PARTS || groups < 1 || groups > 2 || g >= groups ||
+            avail < LINK_H264_PART || len > LINK_H264_PART) return;
+        memcpy(g_h264Par[g], data, LINK_H264_PART);
+        g_h264ParHave[g] = true;
+        g_h264Groups = groups;
+        g_h264Total = parts;
+        g_h264LastLen = len;
+        if (!g_h264SeqKnown) { g_h264SeqBase = fp->seq - (u32)(parts + g); g_h264SeqKnown = true; }
     }
-    if (fp->flags & LINK_FRAME_LAST)
+    else
     {
-        g_h264Total = (int)idx + 1;
-        g_h264Size = idx * LINK_H264_PART + len;
+        if (idx >= H264_MAX_PARTS || len > avail || len > LINK_H264_PART) return;
+        if (!g_h264Have[idx])
+        {
+            u8* dst = g_h264Buf + idx * LINK_H264_PART;
+            memcpy(dst, data, len);
+            if (len < LINK_H264_PART) memset(dst + len, 0, LINK_H264_PART - len);   /* for the parity */
+            g_h264Have[idx] = 1;
+            g_h264Got++;
+        }
+        if (!g_h264SeqKnown) { g_h264SeqBase = fp->seq - idx; g_h264SeqKnown = true; }
+        if (fp->flags & LINK_FRAME_LAST)
+        {
+            g_h264Total = (int)idx + 1;
+            g_h264Size = idx * LINK_H264_PART + len;
+            g_h264LastLen = len;
+        }
     }
-    if (g_h264Total > 0 && g_h264Got >= g_h264Total)
+    if (g_h264Total > 0 && g_h264Got < g_h264Total) h264Repair();
+    if (g_h264Total > 0 && g_h264Got >= g_h264Total && g_h264Size > 0)
     {
         g_h264Open = false;
         if (g_h264Broken && !g_h264Key) { g_h264Dropped++; return; }   /* wait for a key frame */
@@ -3301,7 +3361,9 @@ int main(int argc, char** argv)
         }
         int listCount = g_tab == 1 ? g_libCount : g_gameCount;
 
-        bool haveVideo = g_lastVideoTime != 0 && osGetTime() - g_lastVideoTime < 3000;
+        /* H.264 sends nothing while the picture stands still: keep showing it */
+        bool haveVideo = g_lastVideoTime != 0 &&
+                         (osGetTime() - g_lastVideoTime < 3000 || (g_rotMode && g_tcpConnected));
         bool zoom = g_zoom;
 
         /* redraw when something changed; both buffers need it (double buffering) */
