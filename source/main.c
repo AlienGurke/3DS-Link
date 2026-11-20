@@ -484,6 +484,7 @@ static bool g_mvdReady = false;
 static u8* g_mvdIn = NULL;                /* linear memory: one NAL unit */
 static u8* g_mvdOut = NULL;               /* linear memory: the decoded picture */
 static MVDSTD_Config g_mvdConfig;
+static volatile u32 g_h264Shown = 0, g_h264Dropped = 0, g_h264Errors = 0, g_h264Repaired = 0;
 
 /* the hardware decoder (New 3DS only); set up once, when the PC asks */
 static bool mvdSetup(void)
@@ -2016,6 +2017,17 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
         return sendResponse(fd, h, LINK_OK, NULL, 0);
     }
 
+    case LINK_CMD_VIDEOSTATS:
+    {
+        /* H.264 on the 3DS since the last time asked: shown, dropped while waiting for a
+           key frame, rebuilt from parity, decoder errors */
+        static u32 last[4];
+        u32 now[4] = { g_h264Shown, g_h264Dropped, g_h264Repaired, g_h264Errors };
+        u32 d[4];
+        for (int i = 0; i < 4; i++) { d[i] = now[i] - last[i]; last[i] = now[i]; }
+        return sendResponse(fd, h, LINK_OK, d, sizeof(d));
+    }
+
     case LINK_CMD_VIDEOCAPS:
     {
         u32 caps = mvdSetup() ? LINK_VIDCAP_H264 : 0;
@@ -2460,7 +2472,6 @@ static u32 g_h264Frame = 0;
 static bool g_h264Open = false, g_h264Key = false, g_h264Broken = true;
 static int g_h264Got = 0, g_h264Total = -1;
 static u32 g_h264Size = 0;
-static volatile u32 g_h264Shown = 0, g_h264Dropped = 0, g_h264Errors = 0;
 
 static bool h264Decode(u32 size)
 {
@@ -2507,12 +2518,12 @@ static bool h264Decode(u32 size)
     return true;
 }
 
-static u8 g_h264Par[2][LINK_H264_PART];
-static bool g_h264ParHave[2];
+#define H264_MAX_GROUPS 4
+static u8 g_h264Par[H264_MAX_GROUPS][LINK_H264_PART];
+static bool g_h264ParHave[H264_MAX_GROUPS];
 static int g_h264Groups = 0;          /* from a parity packet (0 = none seen) */
 static u32 g_h264LastLen = 0, g_h264SeqBase = 0;
 static bool g_h264SeqKnown = false;
-static volatile u32 g_h264Repaired = 0;
 
 /* one packet missing in a parity group: rebuild it from the parity */
 static void h264Repair(void)
@@ -2558,7 +2569,7 @@ static void h264Packet(const LinkFramePacket* fp, const u8* data, size_t avail)
         g_h264Frame = fp->frameId;
         g_h264Open = true;
         memset(g_h264Have, 0, sizeof(g_h264Have));
-        g_h264ParHave[0] = g_h264ParHave[1] = false;
+        memset(g_h264ParHave, 0, sizeof(g_h264ParHave));
         g_h264Groups = 0;
         g_h264Got = 0;
         g_h264Total = -1;
@@ -2575,7 +2586,7 @@ static void h264Packet(const LinkFramePacket* fp, const u8* data, size_t avail)
         int parts = (int)((fp->baseSeq >> 8) & 0xFFFF);
         int groups = (int)((fp->baseSeq >> 4) & 0xF);
         int g = (int)(fp->baseSeq & 0xF);
-        if (parts <= 0 || parts > H264_MAX_PARTS || groups < 1 || groups > 2 || g >= groups ||
+        if (parts <= 0 || parts > H264_MAX_PARTS || groups < 1 || groups > H264_MAX_GROUPS || g >= groups ||
             avail < LINK_H264_PART || len > LINK_H264_PART) return;
         memcpy(g_h264Par[g], data, LINK_H264_PART);
         g_h264ParHave[g] = true;
