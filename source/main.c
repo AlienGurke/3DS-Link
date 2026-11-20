@@ -270,7 +270,9 @@ static void applyLanguage(void)
     for (int i = 0; i < S_COUNT; i++)
     {
         utf8ToCp437(g_tr[i], sizeof(g_tr[i]), g_custom[g_lang][i][0] ? g_custom[g_lang][i] : g_strs[g_lang][i]);
-        putEmulatorName(g_tr[i], sizeof(g_tr[i]));
+        /* texts that name a particular emulator keep their name */
+        if (i != S_TAB_DS && i != S_TAB_3DS && i != S_NEED_MELONDS && i != S_NEED_AZAHAR)
+            putEmulatorName(g_tr[i], sizeof(g_tr[i]));
     }
 }
 #define T(id) (g_tr[id])
@@ -3518,10 +3520,8 @@ int main(int argc, char** argv)
                 }
                 if ((g_tab == 1) != native)
                 {
-                    /* the other emulator is connected: it cannot start this game */
-                    LightLock_Lock(&g_lock);
-                    snprintf(g_statusText, sizeof(g_statusText), "%s", T(g_tab == 1 ? S_NEED_AZAHAR : S_NEED_MELONDS));
-                    LightLock_Unlock(&g_lock);
+                    /* the other emulator is connected: it cannot start this game
+                       (the line under the list says which one is needed) */
                 }
                 else if (g_gameStarted && strcmp(base, g_currentGame) == 0)
                 {
