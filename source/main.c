@@ -475,6 +475,35 @@ static u16 g_dsImage[240 * 320];          /* what is shown (row length g_vidW) *
 static u16 g_dsBack[240 * 320];           /* tiles are decoded here first */
 static volatile int g_vidW = 256, g_vidH = 192;
 
+/* H.264 picture (New 3DS hardware decoder, Azahar): already laid out like the bottom
+   framebuffer, two buffers so the screen never gets a half written one */
+static u16 g_rotImage[2][LINK_H264_WIDTH * LINK_H264_HEIGHT];
+static volatile int g_rotIdx = 0;
+static volatile bool g_rotMode = false;   /* the picture comes as H.264 */
+static bool g_mvdReady = false;
+static u8* g_mvdIn = NULL;                /* linear memory: one NAL unit */
+static u8* g_mvdOut = NULL;               /* linear memory: the decoded picture */
+static MVDSTD_Config g_mvdConfig;
+
+/* the hardware decoder (New 3DS only); set up once, when the PC asks */
+static bool mvdSetup(void)
+{
+    if (g_mvdReady) return true;
+    bool isNew = false;
+    APT_CheckNew3DS(&isNew);
+    if (!isNew) return false;
+    if (!g_mvdIn) g_mvdIn = (u8*)linearMemAlign(0x40000, 0x40);
+    if (!g_mvdOut) g_mvdOut = (u8*)linearMemAlign(LINK_H264_WIDTH * LINK_H264_HEIGHT * 2, 0x40);
+    if (!g_mvdIn || !g_mvdOut) return false;
+    if (R_FAILED(mvdstdInit(MVDMODE_VIDEOPROCESSING, MVD_INPUT_H264, MVD_OUTPUT_BGR565,
+                            MVD_DEFAULT_WORKBUF_SIZE, NULL)))
+        return false;
+    mvdstdGenerateDefaultConfig(&g_mvdConfig, LINK_H264_WIDTH, LINK_H264_HEIGHT, LINK_H264_WIDTH,
+                                LINK_H264_HEIGHT, NULL, (u32*)g_mvdOut, (u32*)g_mvdOut);
+    g_mvdReady = true;
+    return true;
+}
+
 /* picture size for the emulator on the PC; the old picture is dropped */
 static void setVideoGeometry(u32 client)
 {
@@ -1987,6 +2016,12 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
         return sendResponse(fd, h, LINK_OK, NULL, 0);
     }
 
+    case LINK_CMD_VIDEOCAPS:
+    {
+        u32 caps = mvdSetup() ? LINK_VIDCAP_H264 : 0;
+        return sendResponse(fd, h, LINK_OK, &caps, sizeof(caps));
+    }
+
     case LINK_CMD_LIBRARY:
     {
         /* Azahar's game list for the 3DS tab */
@@ -2417,6 +2452,108 @@ static bool haveAll(u32 from, u32 to)
     return true;
 }
 
+/* ---- H.264: put the packets of a frame together, decode it in hardware ---- */
+#define H264_MAX_PARTS 160
+static u8 g_h264Buf[H264_MAX_PARTS * LINK_H264_PART];
+static u8 g_h264Have[H264_MAX_PARTS];
+static u32 g_h264Frame = 0;
+static bool g_h264Open = false, g_h264Key = false, g_h264Broken = true;
+static int g_h264Got = 0, g_h264Total = -1;
+static u32 g_h264Size = 0;
+static volatile u32 g_h264Shown = 0, g_h264Dropped = 0, g_h264Errors = 0;
+
+static bool h264Decode(u32 size)
+{
+    const u8* p = g_h264Buf;
+    const u8* end = g_h264Buf + size;
+    /* the NAL units, each after a start code 00 00 01 (or 00 00 00 01) */
+    const u8* nal = NULL;
+    for (const u8* q = p; ; q++)
+    {
+        bool startCode = q + 3 <= end && q[0] == 0 && q[1] == 0 && q[2] == 1;
+        if (startCode || q >= end)
+        {
+            if (nal)
+            {
+                const u8* nalEnd = q;
+                if (startCode && nalEnd > nal && nalEnd[-1] == 0) nalEnd--;   /* 4-byte code */
+                size_t len = (size_t)(nalEnd - nal);
+                if (len > 0 && len <= 0x40000)
+                {
+                    memcpy(g_mvdIn, nal, len);
+                    GSPGPU_FlushDataCache(g_mvdIn, len);
+                    MVDSTD_ProcessNALUnitOut out;
+                    Result ret = mvdstdProcessVideoFrame(g_mvdIn, len, 0, &out);
+                    if (!MVD_CHECKNALUPROC_SUCCESS(ret)) { g_h264Errors++; return false; }
+                    if (ret != MVD_STATUS_PARAMSET && ret != MVD_STATUS_INCOMPLETEPROCESSING)
+                    {
+                        g_mvdConfig.physaddr_outdata0 = osConvertVirtToPhys(g_mvdOut);
+                        if (mvdstdRenderVideoFrame(&g_mvdConfig, true) != MVD_STATUS_OK) { g_h264Errors++; return false; }
+                        GSPGPU_InvalidateDataCache(g_mvdOut, LINK_H264_WIDTH * LINK_H264_HEIGHT * 2);
+                        int next = g_rotIdx ^ 1;
+                        memcpy(g_rotImage[next], g_mvdOut, sizeof(g_rotImage[0]));
+                        g_rotIdx = next;
+                        g_rotMode = true;
+                        g_videoFrames++;
+                        g_h264Shown++;
+                    }
+                }
+            }
+            if (q >= end) break;
+            nal = q + 3;
+            q += 2;
+        }
+    }
+    return true;
+}
+
+static void h264Packet(const LinkFramePacket* fp, const u8* data, size_t avail)
+{
+    if (g_h264Open || g_h264Frame != 0)
+    {
+        s32 d = (s32)(fp->frameId - g_h264Frame);
+        if (d < 0) return;   /* a late packet of an older frame */
+        if (d > 0)
+        {
+            if (g_h264Open) { g_h264Broken = true; g_h264Dropped++; }   /* never complete */
+            g_h264Open = false;
+        }
+    }
+    if (!g_h264Open && fp->frameId != g_h264Frame)
+    {
+        g_h264Frame = fp->frameId;
+        g_h264Open = true;
+        memset(g_h264Have, 0, sizeof(g_h264Have));
+        g_h264Got = 0;
+        g_h264Total = -1;
+        g_h264Size = 0;
+        g_h264Key = (fp->flags & LINK_FRAME_KEY) != 0;
+    }
+    if (!g_h264Open) return;   /* this frame is done already */
+    u32 idx = (fp->flags & 0x7FFF) >> LINK_FRAME_INDEX_SHIFT;
+    u32 len = fp->entryCount;
+    if (idx >= H264_MAX_PARTS || len > avail || len > LINK_H264_PART) return;
+    if (!g_h264Have[idx])
+    {
+        memcpy(g_h264Buf + idx * LINK_H264_PART, data, len);
+        g_h264Have[idx] = 1;
+        g_h264Got++;
+    }
+    if (fp->flags & LINK_FRAME_LAST)
+    {
+        g_h264Total = (int)idx + 1;
+        g_h264Size = idx * LINK_H264_PART + len;
+    }
+    if (g_h264Total > 0 && g_h264Got >= g_h264Total)
+    {
+        g_h264Open = false;
+        if (g_h264Broken && !g_h264Key) { g_h264Dropped++; return; }   /* wait for a key frame */
+        bool ok = h264Decode(g_h264Size);
+        if (!ok) g_h264Broken = true;
+        else if (g_h264Key) g_h264Broken = false;
+    }
+}
+
 static void videoThread(void* arg)
 {
     (void)arg;
@@ -2462,7 +2599,15 @@ static void videoThread(void* arg)
         if ((size_t)n < sizeof(LinkFramePacket)) continue;
         LinkFramePacket fp;
         memcpy(&fp, buf, sizeof(fp));
+        if (fp.magic == LINK_H264_MAGIC)
+        {
+            noteVideoSeq(fp.seq);
+            g_lastVideoTime = osGetTime();
+            if (g_mvdReady) h264Packet(&fp, buf + sizeof(fp), (size_t)n - sizeof(fp));
+            continue;
+        }
         if (fp.magic != LINK_FRAME_MAGIC) continue;
+        g_rotMode = false;   /* tiles again */
 
         if (fp.frameId != curFrame)
         {
@@ -2770,6 +2915,8 @@ static void drawBottom(bool haveVideo, bool zoom, bool touching, int tx, int ty)
         /* 3DS bottom screen (Azahar): exactly the size of ours */
         if (!haveVideo)
             for (int i = 0; i < 320 * 240; i++) fb[i] = empty;
+        else if (g_rotMode)
+            memcpy(fb, g_rotImage[g_rotIdx], sizeof(g_rotImage[0]));   /* H.264: same layout */
         else
             for (int x = 0; x < 320; x++)
             {
@@ -3811,6 +3958,7 @@ int main(int argc, char** argv)
     close(g_udpFd);
     close(g_videoFd);
     socExit();
+    if (g_mvdReady) mvdstdExit();
     irrstExit();
     setTopBacklight(true);
     setBottomBacklight(true);
