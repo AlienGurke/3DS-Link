@@ -1534,6 +1534,8 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
         if (flags & LINK_SESSION_LAUNCH_DONE) g_launchPending = false;
         if (name[0])
         {
+            /* the game runs: "Starting game - waiting..." is over */
+            if (strcmp(g_statusText, T(S_STARTING)) == 0) g_statusText[0] = 0;
             bool same = g_gameStarted && strcmp(g_currentGame, name) == 0;
             g_launchPending = false;
             snprintf(g_currentGame, sizeof(g_currentGame), "%s", name);
@@ -2979,7 +2981,7 @@ static void drawBottom(bool haveVideo, bool zoom, bool touching, int tx, int ty)
     u16* fb = (u16*)gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, NULL, NULL);
     const u16 bg = LINK_RGB565(0x10, 0x10, 0x14);
     const u16 frame = LINK_RGB565(0x50, 0x50, 0x60);
-    const u16 empty = LINK_RGB565(0x22, 0x22, 0x2A);
+    const u16 empty = 0;   /* no picture: black, like a 3DS whose game draws nothing yet */
 
     if (g_vidW == 320)
     {
