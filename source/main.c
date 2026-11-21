@@ -3620,8 +3620,24 @@ int main(int argc, char** argv)
             for (u32 no = first; no != w + 1 && (s32)(w - no) >= 0; no++)
             {
                 int slot = (int)(no % ROT_SLOTS);
-                /* shown at the next screen refresh: due within half a refresh counts */
-                if (g_rotDue[slot] <= now + 8 || w - shownNo >= 3) { pick = slot; pickNo = no; }
+                u64 due = g_rotDue[slot];
+                u32 src = g_rotSrc[slot];
+                s32 gap = (s32)(src - prevSrc);
+                bool ok;
+                if (src && prevSrc && gap > 0 && gap <= 100 && prevShown)
+                {
+                    /* Locked to the refreshes: made 2 refreshes after the picture on the screen,
+                       it is shown exactly 2 refreshes after it - a due time a few ms early or
+                       late (the wait adapting, clocks drifting) does not make it 1 or 3.
+                       Only when clearly off by more does it move by a refresh. */
+                    u32 k = ((u32)gap * 1000 + 8355) / 16711;   /* refreshes (59.83 a second) */
+                    if (k < 1) k = 1;
+                    u64 slotTime = prevShown + ((u64)k * 16711 + 500) / 1000;
+                    ok = (now + 4 >= slotTime && due <= now + 25) ||
+                         (now + 4 + 17 >= slotTime && due + 25 < now);   /* far behind: catch up */
+                }
+                else ok = due <= now + 8;   /* shown at the next refresh: within half a refresh */
+                if (ok || w - shownNo >= 3) { pick = slot; pickNo = no; }
             }
             if (pick >= 0)
             {
