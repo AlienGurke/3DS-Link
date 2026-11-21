@@ -2414,12 +2414,19 @@ static bool g_ackValid = false;
 static void noteVideoSeq(u32 seq)
 {
     LightLock_Lock(&g_ackLock);
-    /* a big jump backwards means melonDS was restarted: start over */
-    if (!g_ackValid || (s32)(seq - g_ackSeq) < -4096)
+    /* a big jump backwards means melonDS was restarted: start over. And should the
+       receipts ever stick far ahead (packets keep coming from far behind), start over too -
+       else the PC takes every packet for lost and sends everything again and again */
+    static u32 behind = 0;
+    s32 diff = (s32)(seq - g_ackSeq);
+    if (diff < -64) behind++;
+    else behind = 0;
+    if (!g_ackValid || diff < -4096 || diff > 4096 || behind > 256)
     {
         g_ackSeq = seq;
         g_ackMask = 1;
         g_ackValid = true;
+        behind = 0;
     }
     else if ((s32)(seq - g_ackSeq) > 0)
     {
