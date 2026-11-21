@@ -492,6 +492,7 @@ static volatile u64 g_rotMade[ROT_SLOTS];  /* when it was decoded */
 static volatile u32 g_rotSrc[ROT_SLOTS];   /* the PC's time of it (0 = unknown) */
 static volatile u32 g_h264Glitched = 0;   /* frames decoded although one before got lost */
 static volatile u32 g_loopSlow = 0;
+static u64 g_vblankTime = 0;   /* when the last screen refresh began (main loop) */
 /* while it moves: how many screen refreshes each picture stood (1, 2, 3, 4+) */
 static volatile u32 g_dispGaps[4];   /* main loop missed a screen refresh */
 static volatile u32 g_rotLate = 0, g_rotStutter = 0, g_rotWaitSum = 0, g_rotWaitN = 0;
@@ -3608,7 +3609,9 @@ int main(int argc, char** argv)
             static u64 prevShown = 0;
             u32 w = g_rotWritten;
             __sync_synchronize();
-            u64 now = osGetTime();
+            /* the time of the refresh, not of this line: how long the loop took to get here
+               varies, and would shift pictures near the edge to the next refresh */
+            u64 now = g_vblankTime ? g_vblankTime : osGetTime();
             if (w - shownNo > 1000) shownNo = w - 1;   /* restarted */
             u32 first = shownNo + 1;
             if (w >= ROT_SLOTS - 1 && first < w - (ROT_SLOTS - 2)) first = w - (ROT_SLOTS - 2);
@@ -4287,6 +4290,7 @@ int main(int argc, char** argv)
         gfxFlushBuffers();
         gfxSwapBuffers();
         gspWaitForVBlank();
+        g_vblankTime = osGetTime();
     }
 
     g_running = false;
