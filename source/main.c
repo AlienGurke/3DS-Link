@@ -492,6 +492,7 @@ static volatile u64 g_rotMade[ROT_SLOTS];  /* when it was decoded */
 static volatile u32 g_rotSrc[ROT_SLOTS];   /* the PC's time of it (0 = unknown) */
 static volatile u32 g_h264Glitched = 0;   /* frames decoded although one before got lost */
 static volatile u32 g_loopSlow = 0;
+static volatile int g_tosResult = -1;   /* input packets' WiFi priority: 0 = set, else the error; -1 = not tried */
 static volatile u32 g_tileRebuilt = 0;
 /* input round trip (3DS -> PC -> 3DS): when each input packet went out, and the results */
 static volatile u64 g_inSentTick[256];
@@ -2100,9 +2101,11 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
     case LINK_CMD_VIDEOCAPS:
     {
         linkGfInit();
-        u32 caps = (mvdSetup() ? (LINK_VIDCAP_H264 | LINK_VIDCAP_H264_RS) : 0) |
-                   LINK_VIDCAP_TILE_RS | LINK_VIDCAP_TILE_TS | LINK_VIDCAP_ECHO;
-        return sendResponse(fd, h, LINK_OK, &caps, sizeof(caps));
+        /* then (newer apps) whether the input packets got the WiFi priority (0 = yes) */
+        u32 caps[2] = { (mvdSetup() ? (LINK_VIDCAP_H264 | LINK_VIDCAP_H264_RS) : 0) |
+                            LINK_VIDCAP_TILE_RS | LINK_VIDCAP_TILE_TS | LINK_VIDCAP_ECHO,
+                        (u32)g_tosResult };
+        return sendResponse(fd, h, LINK_OK, caps, sizeof(caps));
     }
 
     case LINK_CMD_LIBRARY:
@@ -2308,6 +2311,16 @@ static int openListenSocket(void)
     listen(fd, 1);
     fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
     return fd;
+}
+
+/* The input packets as the WiFi's top priority class (DSCP CS6 -> WMM "voice"): with
+   many picture packets in the air the 3DS then gets to send sooner. Whether the 3DS's WiFi
+   honours it is not known; the PC logs the round trip (LINK_VIDCAP_ECHO) to see. */
+static void markInputPriority(int fd)
+{
+    if (fd < 0) return;
+    int tos = 0xC0;
+    g_tosResult = setsockopt(fd, IPPROTO_IP, IP_TOS, &tos, sizeof(tos)) == 0 ? 0 : (errno ? errno : 1);
 }
 
 static int openUdpSocket(u16 port, int rcvbuf)
@@ -3168,6 +3181,7 @@ static void inputThread(void* arg)
             gen = g_sockGen;
             if (g_udpFd >= 0) close(g_udpFd);
             g_udpFd = openUdpSocket(LINK_UDP_PORT, 0);
+            markInputPriority(g_udpFd);
             havePeer = false;
         }
 
@@ -3685,6 +3699,7 @@ int main(int argc, char** argv)
 
     g_listenFd = openListenSocket();
     g_udpFd = openUdpSocket(LINK_UDP_PORT, 0);
+    markInputPriority(g_udpFd);
     g_videoFd = openUdpSocket(LINK_VIDEO_PORT, 128 * 1024);   /* room for bursts of tile packets */
 
     s32 prio = 0x30;
