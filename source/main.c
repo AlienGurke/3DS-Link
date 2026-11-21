@@ -491,7 +491,9 @@ static volatile u64 g_rotDue[ROT_SLOTS];   /* when to show it (osGetTime) */
 static volatile u64 g_rotMade[ROT_SLOTS];  /* when it was decoded */
 static volatile u32 g_rotSrc[ROT_SLOTS];   /* the PC's time of it (0 = unknown) */
 static volatile u32 g_h264Glitched = 0;   /* frames decoded although one before got lost */
-static volatile u32 g_loopSlow = 0;   /* main loop missed a screen refresh */
+static volatile u32 g_loopSlow = 0;
+/* while it moves: how many screen refreshes each picture stood (1, 2, 3, 4+) */
+static volatile u32 g_dispGaps[4];   /* main loop missed a screen refresh */
 static volatile u32 g_rotLate = 0, g_rotStutter = 0, g_rotWaitSum = 0, g_rotWaitN = 0;
 static volatile bool g_rotMode = false;   /* the picture comes as H.264 */
 static bool g_mvdReady = false;
@@ -2043,11 +2045,11 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
     {
         /* H.264 on the 3DS since the last time asked: shown, dropped while waiting for a
            key frame, rebuilt from parity, decoder errors */
-        static u32 last[12];
-        u32 now[12] = { g_h264Shown, g_h264Dropped, g_h264Repaired, g_h264Errors, g_vidOverruns,
+        static u32 last[16];
+        u32 now[16] = { g_h264Shown, g_h264Dropped, g_h264Repaired, g_h264Errors, g_vidOverruns,
                         g_stallCount, g_stallTotalMs, g_h264Glitched, g_rotLate, g_rotStutter, g_rotWaitN,
-                        g_loopSlow };
-        u32 d[14];
+                        g_loopSlow, g_dispGaps[0], g_dispGaps[1], g_dispGaps[2], g_dispGaps[3] };
+        u32 d[18];
         for (int i = 0; i < 5; i++) { d[i] = now[i] - last[i]; last[i] = now[i]; }
         d[5] = g_vidRcvBuf;
         d[6] = now[5] - last[5]; last[5] = now[5];
@@ -2064,6 +2066,7 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
         lastWait = waitSum;
         d[13] = now[11] - last[11];   /* screen refreshes the main loop missed */
         last[11] = now[11];
+        for (int i = 12; i < 16; i++) { d[i + 2] = now[i] - last[i]; last[i] = now[i]; }
         return sendResponse(fd, h, LINK_OK, d, sizeof(d));
     }
 
@@ -2544,7 +2547,12 @@ static u64 rotDue(u32 ts, u64 now)
     }
     s32 lo = tmp[0], hi = tmp[(n * 9) / 10 < n ? (n * 9) / 10 : n - 1];
     if (hi - lo > 50) hi = lo + 50;   /* never more than 50 ms extra */
-    return hi > rel ? now + (u64)(hi - rel) : now;
+    /* the wait itself only moves slowly: else its own wobble makes the pictures uneven */
+    static s32 cur;
+    if (n == 1) cur = hi;
+    else if (hi > cur) cur += hi - cur > 2 ? 2 : hi - cur;
+    else if (hi < cur) cur -= 1;
+    return cur > rel ? now + (u64)(cur - rel) : now;
 }
 
 static bool h264Decode(u32 size)
@@ -3621,6 +3629,11 @@ int main(int argc, char** argv)
                 u32 src = g_rotSrc[pick];
                 s32 srcGap = (s32)(src - prevSrc);
                 if (src && prevSrc && srcGap > 0 && srcGap <= 40 && now - prevShown > (u64)srcGap + 12) g_rotStutter++;
+                if (src && prevSrc && srcGap > 0 && srcGap <= 60)
+                {
+                    u32 v = (u32)((now - prevShown + 8) / 17);   /* screen refreshes */
+                    g_dispGaps[v < 1 ? 0 : v > 4 ? 3 : v - 1]++;
+                }
                 prevSrc = src;
                 prevShown = now;
                 g_rotIdx = pick;
