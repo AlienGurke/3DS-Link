@@ -481,8 +481,17 @@ static volatile int g_vidW = 256, g_vidH = 192;
 
 /* H.264 picture (New 3DS hardware decoder, Azahar): already laid out like the bottom
    framebuffer, two buffers so the screen never gets a half written one */
-static u16 g_rotImage[2][LINK_H264_WIDTH * LINK_H264_HEIGHT];
-static volatile int g_rotIdx = 0;
+/* decoded H.264 pictures wait here until they are due: shown at the same steady pace the
+   PC made them, not whenever the WiFi happened to bring them (that looked like micro lags) */
+#define ROT_SLOTS 4
+static u16 g_rotImage[ROT_SLOTS][LINK_H264_WIDTH * LINK_H264_HEIGHT];
+static volatile int g_rotIdx = 0;          /* the slot on the screen */
+static volatile u32 g_rotWritten = 0;      /* pictures decoded; picture n is in slot n % ROT_SLOTS */
+static volatile u64 g_rotDue[ROT_SLOTS];   /* when to show it (osGetTime) */
+static volatile u64 g_rotMade[ROT_SLOTS];  /* when it was decoded */
+static volatile u32 g_rotSrc[ROT_SLOTS];   /* the PC's time of it (0 = unknown) */
+static volatile u32 g_h264Glitched = 0;   /* frames decoded although one before got lost */
+static volatile u32 g_rotLate = 0, g_rotStutter = 0, g_rotWaitSum = 0, g_rotWaitN = 0;
 static volatile bool g_rotMode = false;   /* the picture comes as H.264 */
 static bool g_mvdReady = false;
 static u8* g_mvdIn = NULL;                /* linear memory: one NAL unit */
@@ -2033,16 +2042,24 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
     {
         /* H.264 on the 3DS since the last time asked: shown, dropped while waiting for a
            key frame, rebuilt from parity, decoder errors */
-        static u32 last[7];
-        u32 now[7] = { g_h264Shown, g_h264Dropped, g_h264Repaired, g_h264Errors, g_vidOverruns,
-                       g_stallCount, g_stallTotalMs };
-        u32 d[9];
+        static u32 last[11];
+        u32 now[11] = { g_h264Shown, g_h264Dropped, g_h264Repaired, g_h264Errors, g_vidOverruns,
+                        g_stallCount, g_stallTotalMs, g_h264Glitched, g_rotLate, g_rotStutter, g_rotWaitN };
+        u32 d[13];
         for (int i = 0; i < 5; i++) { d[i] = now[i] - last[i]; last[i] = now[i]; }
         d[5] = g_vidRcvBuf;
         d[6] = now[5] - last[5]; last[5] = now[5];
         d[7] = now[6] - last[6]; last[6] = now[6];
         d[8] = g_stallMaxMs;
         g_stallMaxMs = 0;
+        /* glitched (decoded after a loss), shown late, uneven, average wait in the buffer (ms) */
+        for (int i = 7; i < 10; i++) { d[i + 2] = now[i] - last[i]; last[i] = now[i]; }
+        u32 waitN = now[10] - last[10];
+        last[10] = now[10];
+        static u32 lastWait = 0;
+        u32 waitSum = g_rotWaitSum;
+        d[12] = waitN ? (waitSum - lastWait) / waitN : 0;
+        lastWait = waitSum;
         return sendResponse(fd, h, LINK_OK, d, sizeof(d));
     }
 
@@ -2489,11 +2506,42 @@ static u8 g_h264Buf[H264_MAX_PARTS * LINK_H264_PART];
 static u8 g_h264Have[H264_MAX_PARTS];
 static u32 g_h264Frame = 0;
 static bool g_h264Open = false, g_h264Key = false;
-static volatile bool g_h264Broken = true;
+static volatile bool g_h264Broken = true;   /* waits for a key frame (asked for in the input packets) */
 static bool g_h264Clean = false;   /* a key frame was decoded since the decoder started */
-static volatile bool g_allowGlitch = false;   /* option: decode on after a lost frame (smoother, brief glitches) */   /* waits for a key frame (asked for in the input packets) */
+/* option: decode on after a lost frame (smoother; where it moved, the picture is slightly
+   wrong until the key frame the 3DS asks for at once arrives) */
+static volatile bool g_allowGlitch = true;
+static u32 g_h264Ts = 0;           /* the PC's time of the frame being received (0 = none) */
 static int g_h264Got = 0, g_h264Total = -1;
 static u32 g_h264Size = 0;
+
+/* When to show a picture the PC made at `ts` (its clock, ms) and that is decoded now. The
+   delay from the PC to here varies (WiFi, decoding): each picture waits until the delay that
+   9 of 10 recent pictures had - then they come out as evenly as they were made. */
+static u64 rotDue(u32 ts, u64 now)
+{
+    static bool have = false;
+    static u32 base;
+    static s32 win[64], tmp[64];
+    static int n = 0, pos = 0;
+    if (!ts) return now;
+    u32 d = (u32)now - ts;
+    s32 rel = (s32)(d - base);
+    if (!have || rel < -5000 || rel > 5000) { have = true; base = d; rel = 0; n = 0; pos = 0; }
+    win[pos] = rel;
+    pos = (pos + 1) % 64;
+    if (n < 64) n++;
+    for (int i = 0; i < n; i++)   /* insertion sort, 64 values */
+    {
+        s32 v = win[i];
+        int j = i;
+        while (j > 0 && tmp[j - 1] > v) { tmp[j] = tmp[j - 1]; j--; }
+        tmp[j] = v;
+    }
+    s32 lo = tmp[0], hi = tmp[(n * 9) / 10 < n ? (n * 9) / 10 : n - 1];
+    if (hi - lo > 50) hi = lo + 50;   /* never more than 50 ms extra */
+    return hi > rel ? now + (u64)(hi - rel) : now;
+}
 
 static bool h264Decode(u32 size)
 {
@@ -2523,11 +2571,16 @@ static bool h264Decode(u32 size)
                         g_mvdConfig.physaddr_outdata0 = osConvertVirtToPhys(g_mvdOut);
                         if (mvdstdRenderVideoFrame(&g_mvdConfig, true) != MVD_STATUS_OK) { g_h264Errors++; return false; }
                         GSPGPU_InvalidateDataCache(g_mvdOut, LINK_H264_WIDTH * LINK_H264_HEIGHT * 2);
-                        int next = g_rotIdx ^ 1;
-                        memcpy(g_rotImage[next], g_mvdOut, sizeof(g_rotImage[0]));
-                        g_rotIdx = next;
+                        u32 no = g_rotWritten + 1;
+                        int slot = (int)(no % ROT_SLOTS);
+                        u64 now = osGetTime();
+                        memcpy(g_rotImage[slot], g_mvdOut, sizeof(g_rotImage[0]));
+                        g_rotMade[slot] = now;
+                        g_rotDue[slot] = rotDue(g_h264Ts, now);
+                        g_rotSrc[slot] = g_h264Ts;
+                        __sync_synchronize();
+                        g_rotWritten = no;
                         g_rotMode = true;
-                        g_videoFrames++;
                         g_h264Shown++;
                     }
                 }
@@ -2686,6 +2739,7 @@ static void h264Packet(const LinkFramePacket* fp, const u8* data, size_t avail)
             g_h264Got++;
         }
         if (!g_h264SeqKnown) { g_h264SeqBase = fp->seq - idx; g_h264SeqKnown = true; }
+        g_h264Ts = fp->baseSeq;   /* data packets: the PC's time of the frame (LinkProto.h) */
         if (fp->flags & LINK_FRAME_LAST)
         {
             g_h264Total = (int)idx + 1;
@@ -2700,6 +2754,7 @@ static void h264Packet(const LinkFramePacket* fp, const u8* data, size_t avail)
         /* a frame got lost: wait for a key frame - or, if glitches are allowed, decode on
            (the picture is slightly wrong where it moved until the key frame arrives) */
         if (g_h264Broken && !g_h264Key && !(g_allowGlitch && g_h264Clean)) { g_h264Dropped++; return; }
+        if (g_h264Broken && !g_h264Key) g_h264Glitched++;
         bool ok = h264Decode(g_h264Size);
         if (!ok)
         {
@@ -3527,8 +3582,45 @@ int main(int argc, char** argv)
                          (osGetTime() - g_lastVideoTime < 3000 || (g_rotMode && g_tcpConnected));
         bool zoom = g_zoom;
 
+        /* H.264: the newest decoded picture that is due (a backlog is shown at once) */
+        bool newPicture = false;
+        if (g_rotMode)
+        {
+            static u32 shownNo = 0, prevSrc = 0;
+            static u64 prevShown = 0;
+            u32 w = g_rotWritten;
+            __sync_synchronize();
+            u64 now = osGetTime();
+            if (w - shownNo > 1000) shownNo = w - 1;   /* restarted */
+            u32 first = shownNo + 1;
+            if (w >= ROT_SLOTS - 1 && first < w - (ROT_SLOTS - 2)) first = w - (ROT_SLOTS - 2);
+            int pick = -1;
+            u32 pickNo = 0;
+            for (u32 no = first; no != w + 1 && (s32)(w - no) >= 0; no++)
+            {
+                int slot = (int)(no % ROT_SLOTS);
+                /* shown at the next screen refresh: due within half a refresh counts */
+                if (g_rotDue[slot] <= now + 8 || w - shownNo >= 3) { pick = slot; pickNo = no; }
+            }
+            if (pick >= 0)
+            {
+                if (now > g_rotDue[pick] + 17) g_rotLate++;
+                g_rotWaitSum += (u32)(g_rotDue[pick] > g_rotMade[pick] ? g_rotDue[pick] - g_rotMade[pick] : 0);
+                g_rotWaitN++;
+                /* a picture shown clearly later after the one before than the PC made it */
+                u32 src = g_rotSrc[pick];
+                s32 srcGap = (s32)(src - prevSrc);
+                if (src && prevSrc && srcGap > 0 && srcGap <= 40 && now - prevShown > (u64)srcGap + 12) g_rotStutter++;
+                prevSrc = src;
+                prevShown = now;
+                g_rotIdx = pick;
+                shownNo = pickNo;
+                newPicture = true;
+            }
+        }
+
         /* redraw when something changed; both buffers need it (double buffering) */
-        if (g_videoFrames != lastVideoFrames || zoom != lastZoom || haveVideo != lastHaveVideo ||
+        if (newPicture || g_videoFrames != lastVideoFrames || zoom != lastZoom || haveVideo != lastHaveVideo ||
             (!haveVideo && (in.keys & KEY_TOUCH)))
             redrawBoth = 2;
         if (zoom != savedZoom) { saveConfig(); savedZoom = zoom; }
