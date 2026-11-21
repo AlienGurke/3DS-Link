@@ -103,6 +103,7 @@ enum StrId
     S_M_SHOTMODE, S_SHOT_BOTH, S_SHOT_TOP, S_SHOT_BOTTOM, S_SHOT_SEPARATE,
     S_M_STATUSBAR, S_BAT, S_WIFI,
     S_TAB_DS, S_TAB_3DS, S_NO_LIB, S_NEED_MELONDS, S_NEED_AZAHAR, S_ON3DS,
+    S_M_GLITCH, S_GLITCH_ALLOW, S_GLITCH_NEVER,
     S_COUNT
 };
 
@@ -132,6 +133,7 @@ static const char* const g_strs[LANG_COUNT][S_COUNT] = {
         "DS - melonDS", "3DS - Azahar", "No games in Azahar's game list.",
         "To start a DS game: connect melonDS", "To start a 3DS game: connect Azahar",
         "3DS = also installed on this 3DS",
+        "Picture glitches", "allow (smoother)", "never (pauses briefly)",
     },
     {   /* Deutsch */
         "melonDS Link", "IP-Adresse:", "verbunden", "wartet...", "Steuerung:", "aktiv", "Bild:",
@@ -159,6 +161,7 @@ static const char* const g_strs[LANG_COUNT][S_COUNT] = {
         "DS - melonDS", "3DS - Azahar", "Keine Spiele in Azahars Spieleliste.",
         "Für DS-Spiele: melonDS verbinden", "Für 3DS-Spiele: Azahar verbinden",
         "3DS = auch auf diesem 3DS installiert",
+        "Bildfehler", "erlauben (flüssiger)", "nie (hält kurz an)",
     },
 };
 static char g_tr[S_COUNT][80];   /* current language, already in code page 437 */
@@ -180,6 +183,7 @@ static const char* const g_strKeys[S_COUNT] = {
     "menu_shotmode", "shot_both", "shot_top", "shot_bottom", "shot_separate",
     "menu_statusbar", "battery", "wifi",
     "tab_ds", "tab_3ds", "no_library", "need_melonds", "need_azahar", "on_3ds",
+    "menu_glitch", "glitch_allow", "glitch_never",
 };
 /* the files carry a fingerprint of the built-in texts: when an app update
    changes a text, they are written anew (so the change shows up) */
@@ -2485,7 +2489,9 @@ static u8 g_h264Buf[H264_MAX_PARTS * LINK_H264_PART];
 static u8 g_h264Have[H264_MAX_PARTS];
 static u32 g_h264Frame = 0;
 static bool g_h264Open = false, g_h264Key = false;
-static volatile bool g_h264Broken = true;   /* waits for a key frame (asked for in the input packets) */
+static volatile bool g_h264Broken = true;
+static bool g_h264Clean = false;   /* a key frame was decoded since the decoder started */
+static volatile bool g_allowGlitch = false;   /* option: decode on after a lost frame (smoother, brief glitches) */   /* waits for a key frame (asked for in the input packets) */
 static int g_h264Got = 0, g_h264Total = -1;
 static u32 g_h264Size = 0;
 
@@ -2617,12 +2623,13 @@ static void h264Packet(const LinkFramePacket* fp, const u8* data, size_t avail)
         g_h264Frame = 0;
         g_h264Open = false;
         g_h264Broken = true;   /* the decoder needs a key frame first */
+        g_h264Clean = false;
     }
     if (g_h264Open || g_h264Frame != 0)
     {
         s32 d = (s32)(fp->frameId - g_h264Frame);
         /* far back: Azahar was restarted and counts from 1 again */
-        if (d < -1000) { g_h264Frame = 0; g_h264Open = false; g_h264Broken = true; d = 1; }
+        if (d < -1000) { g_h264Frame = 0; g_h264Open = false; g_h264Broken = true; g_h264Clean = false; d = 1; }
         if (d < 0) return;   /* a late packet of an older frame */
         if (d > 0)
         {
@@ -2690,7 +2697,9 @@ static void h264Packet(const LinkFramePacket* fp, const u8* data, size_t avail)
     if (g_h264Total > 0 && g_h264Got >= g_h264Total && g_h264Size > 0)
     {
         g_h264Open = false;
-        if (g_h264Broken && !g_h264Key) { g_h264Dropped++; return; }   /* wait for a key frame */
+        /* a frame got lost: wait for a key frame - or, if glitches are allowed, decode on
+           (the picture is slightly wrong where it moved until the key frame arrives) */
+        if (g_h264Broken && !g_h264Key && !(g_allowGlitch && g_h264Clean)) { g_h264Dropped++; return; }
         bool ok = h264Decode(g_h264Size);
         if (!ok)
         {
@@ -2708,6 +2717,7 @@ static void h264Packet(const LinkFramePacket* fp, const u8* data, size_t avail)
             }
             g_stallSince = 0;
             g_h264Broken = false;
+            g_h264Clean = true;
         }
     }
 }
@@ -3265,6 +3275,7 @@ static void loadConfig(void)
         else if (sscanf(line, "videooff=%d", &v) == 1) g_videoOff = v != 0;
         else if (sscanf(line, "shotmode=%d", &v) == 1) g_shotMode = v >= 0 && v < LINK_SHOT_MODES ? v : 0;
         else if (sscanf(line, "statusbar=%d", &v) == 1) g_statusBar = v != 0;
+        else if (sscanf(line, "glitch=%d", &v) == 1) g_allowGlitch = v != 0;
         else if (sscanf(line, "lang=%d", &v) == 1) g_lang = v;
         else if (sscanf(line, "client=%d", &v) == 1) g_client = v == (int)LINK_CLIENT_AZAHAR ? LINK_CLIENT_AZAHAR : LINK_CLIENT_MELONDS;
         else if (strncmp(line, "last=", 5) == 0)
@@ -3290,6 +3301,7 @@ static void saveConfig(void)
     fprintf(f, "videooff=%d\n", g_videoOff ? 1 : 0);
     fprintf(f, "shotmode=%d\n", g_shotMode);
     fprintf(f, "statusbar=%d\n", g_statusBar ? 1 : 0);
+    fprintf(f, "glitch=%d\n", g_allowGlitch ? 1 : 0);
     fprintf(f, "lang=%d\n", g_lang);
     fprintf(f, "client=%d\n", (int)g_client);
     fprintf(f, "romdir=%s\n", g_romDir);
@@ -3655,8 +3667,8 @@ int main(int argc, char** argv)
         setBottomBacklight(!g_videoOff && !lidDark);
 
         /* the menu: only what makes sense right now */
-        enum { MI_BACK, MI_GAMES, MI_SHOT, MI_SHOTMODE, MI_BACKUPS, MI_DISPLAY, MI_BOTTOM, MI_TOPOFF, MI_STATUSBAR, MI_LANG, MI_STOP, MI_QUIT };
-        int items[12], itemCount = 0;
+        enum { MI_BACK, MI_GAMES, MI_SHOT, MI_SHOTMODE, MI_BACKUPS, MI_DISPLAY, MI_BOTTOM, MI_TOPOFF, MI_STATUSBAR, MI_GLITCH, MI_LANG, MI_STOP, MI_QUIT };
+        int items[13], itemCount = 0;
         bool playing = g_gameStarted && !g_launchPending;
         if (g_gameStarted) items[itemCount++] = MI_BACK;
         items[itemCount++] = MI_GAMES;
@@ -3678,6 +3690,7 @@ int main(int argc, char** argv)
         items[itemCount++] = MI_BOTTOM;
         items[itemCount++] = MI_TOPOFF;
         items[itemCount++] = MI_STATUSBAR;
+        if (g_mvdReady && g_client == LINK_CLIENT_AZAHAR) items[itemCount++] = MI_GLITCH;
         items[itemCount++] = MI_LANG;
         if (playing && g_tcpConnected) items[itemCount++] = MI_STOP;
         items[itemCount++] = MI_QUIT;
@@ -3766,6 +3779,10 @@ int main(int argc, char** argv)
                     break;
                 case MI_STATUSBAR:
                     g_statusBar = !g_statusBar;
+                    saveConfig();
+                    break;
+                case MI_GLITCH:
+                    g_allowGlitch = !g_allowGlitch;
                     saveConfig();
                     break;
                 case MI_BOTTOM:
@@ -4041,6 +4058,7 @@ int main(int argc, char** argv)
                 case MI_BOTTOM: snprintf(label, sizeof(label), "%s: %s", T(S_M_BOTTOM), g_videoOff ? T(S_OFF) : T(S_ON)); break;
                 case MI_TOPOFF: snprintf(label, sizeof(label), "%s", T(S_M_TOPOFF)); break;
                 case MI_STATUSBAR: snprintf(label, sizeof(label), "%s: %s", T(S_M_STATUSBAR), g_statusBar ? T(S_ON) : T(S_OFF)); break;
+                case MI_GLITCH: snprintf(label, sizeof(label), "%s: %s", T(S_M_GLITCH), g_allowGlitch ? T(S_GLITCH_ALLOW) : T(S_GLITCH_NEVER)); break;
                 case MI_LANG: snprintf(label, sizeof(label), "%s: %s", T(S_M_LANG), T(S_LANGNAME)); break;
                 case MI_STOP: snprintf(label, sizeof(label), "%s", T(S_M_STOP)); break;
                 case MI_BACKUPS:
