@@ -492,7 +492,10 @@ static volatile u64 g_rotMade[ROT_SLOTS];  /* when it was decoded */
 static volatile u32 g_rotSrc[ROT_SLOTS];   /* the PC's time of it (0 = unknown) */
 static volatile u32 g_h264Glitched = 0;   /* frames decoded although one before got lost */
 static volatile u32 g_loopSlow = 0;
-static volatile u32 g_tileRebuilt = 0;   /* tile packets rebuilt from parity */
+static volatile u32 g_tileRebuilt = 0;
+/* input round trip (3DS -> PC -> 3DS): when each input packet went out, and the results */
+static volatile u64 g_inSentTick[256];
+static volatile u32 g_rttCount = 0, g_rttSumUs = 0, g_rttMaxUs = 0;   /* tile packets rebuilt from parity */
 static volatile u32 g_tileShown = 0, g_tileForced = 0;   /* tiles: pictures shown, by the 250 ms safety net */
 static u64 g_vblankTime = 0;   /* when the last screen refresh began (main loop) */
 /* while it moves: how many screen refreshes each picture stood (1, 2, 3, 4+) */
@@ -2050,12 +2053,12 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
     {
         /* H.264 on the 3DS since the last time asked: shown, dropped while waiting for a
            key frame, rebuilt from parity, decoder errors */
-        static u32 last[19];
-        u32 now[19] = { g_h264Shown, g_h264Dropped, g_h264Repaired, g_h264Errors, g_vidOverruns,
+        static u32 last[21];
+        u32 now[21] = { g_h264Shown, g_h264Dropped, g_h264Repaired, g_h264Errors, g_vidOverruns,
                         g_stallCount, g_stallTotalMs, g_h264Glitched, g_rotLate, g_rotStutter, g_rotWaitN,
                         g_loopSlow, g_dispGaps[0], g_dispGaps[1], g_dispGaps[2], g_dispGaps[3],
-                        g_tileShown, g_tileForced, g_tileRebuilt };
-        u32 d[21];
+                        g_tileShown, g_tileForced, g_tileRebuilt, g_rttCount, g_rttSumUs };
+        u32 d[24];
         for (int i = 0; i < 5; i++) { d[i] = now[i] - last[i]; last[i] = now[i]; }
         d[5] = g_vidRcvBuf;
         d[6] = now[5] - last[5]; last[5] = now[5];
@@ -2073,6 +2076,13 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
         d[13] = now[11] - last[11];   /* screen refreshes the main loop missed */
         last[11] = now[11];
         for (int i = 12; i < 19; i++) { d[i + 2] = now[i] - last[i]; last[i] = now[i]; }
+        /* input round trip: count, average and longest in microseconds */
+        d[21] = now[19] - last[19];
+        d[22] = d[21] ? (now[20] - last[20]) / d[21] : 0;
+        last[19] = now[19];
+        last[20] = now[20];
+        d[23] = g_rttMaxUs;
+        g_rttMaxUs = 0;
         return sendResponse(fd, h, LINK_OK, d, sizeof(d));
     }
 
@@ -2091,7 +2101,7 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
     {
         linkGfInit();
         u32 caps = (mvdSetup() ? (LINK_VIDCAP_H264 | LINK_VIDCAP_H264_RS) : 0) |
-                   LINK_VIDCAP_TILE_RS | LINK_VIDCAP_TILE_TS;
+                   LINK_VIDCAP_TILE_RS | LINK_VIDCAP_TILE_TS | LINK_VIDCAP_ECHO;
         return sendResponse(fd, h, LINK_OK, &caps, sizeof(caps));
     }
 
@@ -2884,6 +2894,24 @@ static void videoRecvThread(void* arg)
             ssize_t n = recvfrom(g_videoFd, dst, VSLOT, 0, NULL, NULL);
             if (n <= 0) break;
             got++;
+            if (n == 8)
+            {
+                /* the PC's echo of an input packet: how long the round trip took */
+                u32 msg[2];
+                memcpy(msg, dst, 8);
+                if (msg[0] == LINK_ECHO_MAGIC)
+                {
+                    u64 sent = g_inSentTick[msg[1] & 255];
+                    u64 us = sent ? (svcGetSystemTick() - sent) * 1000000ULL / SYSCLOCK_ARM11 : 0;
+                    if (sent && us < 2000000)
+                    {
+                        g_rttCount++;
+                        g_rttSumUs += (u32)us;
+                        if (us > g_rttMaxUs) g_rttMaxUs = (u32)us;
+                    }
+                    continue;
+                }
+            }
             if ((size_t)n >= sizeof(LinkFramePacket))
             {
                 /* receipts at once, not only after decoding */
@@ -3286,6 +3314,7 @@ static void inputThread(void* arg)
             {
                 if (repeatDue && !inputChanged) repeatSends--;
                 p.id = packetId++;
+                g_inSentTick[p.id & 255] = svcGetSystemTick();
                 sendto(g_udpFd, &p, sizeof(p), 0, (struct sockaddr*)&peer, sizeof(peer));
                 lastSent = p;
                 lastSendTime = now;
