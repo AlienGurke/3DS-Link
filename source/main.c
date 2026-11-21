@@ -3861,6 +3861,11 @@ int main(int argc, char** argv)
         {
             static u32 shownNo = 0, prevSrc = 0;
             static u64 prevShown = 0;
+            /* if every picture lately waited more than a refresh beyond its due time, the
+               lock to the refreshes sits a refresh too late: move it one earlier (less delay) */
+            static s32 heldMin = 0x7FFFFFFF;
+            static int heldN = 0;
+            static bool advance = false;
             u32 w = g_rotWritten;
             __sync_synchronize();
             /* the time of the refresh, not of this line: how long the loop took to get here
@@ -3888,6 +3893,7 @@ int main(int argc, char** argv)
                     u32 k = ((u32)gap * 1000 + 8355) / 16711;   /* refreshes (59.83 a second) */
                     if (k < 1) k = 1;
                     u64 slotTime = prevShown + ((u64)k * 16711 + 500) / 1000;
+                    if (advance && k >= 2) slotTime -= 17;
                     ok = (now + 4 >= slotTime && due <= now + 25) ||
                          (now + 4 + 17 >= slotTime && due + 25 < now);   /* far behind: catch up */
                 }
@@ -3915,6 +3921,18 @@ int main(int argc, char** argv)
                 }
                 if (!refine)
                 {
+                    if (src && prevSrc)
+                    {
+                        s32 held = (s32)(now - g_rotDue[pick]);
+                        if (held < heldMin) heldMin = held;
+                        if (++heldN >= 30)
+                        {
+                            advance = heldMin > 14;
+                            heldMin = 0x7FFFFFFF;
+                            heldN = 0;
+                        }
+                        else advance = false;
+                    }
                     prevSrc = src;
                     prevShown = now;
                     /* how long after the PC had this picture it shows: it is drawn now and
