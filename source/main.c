@@ -3754,7 +3754,8 @@ int main(int argc, char** argv)
                 u32 src = g_rotSrc[slot];
                 s32 gap = (s32)(src - prevSrc);
                 bool ok;
-                if (src && prevSrc && gap > 0 && gap <= 100 && prevShown)
+                if (src && src == prevSrc) ok = true;   /* the same picture, only refined: at once */
+                else if (src && prevSrc && gap > 0 && gap <= 100 && prevShown)
                 {
                     /* Locked to the refreshes: made 2 refreshes after the picture on the screen,
                        it is shown exactly 2 refreshes after it - a due time a few ms early or
@@ -3771,9 +3772,14 @@ int main(int argc, char** argv)
             }
             if (pick >= 0)
             {
-                if (now > g_rotDue[pick] + 17) g_rotLate++;
-                g_rotWaitSum += (u32)(g_rotDue[pick] > g_rotMade[pick] ? g_rotDue[pick] - g_rotMade[pick] : 0);
-                g_rotWaitN++;
+                u32 pickSrc = g_rotSrc[pick];
+                bool refine = pickSrc && pickSrc == prevSrc;   /* not a new picture: no pacing, no statistics */
+                if (!refine && now > g_rotDue[pick] + 17) g_rotLate++;
+                if (!refine)
+                {
+                    g_rotWaitSum += (u32)(g_rotDue[pick] > g_rotMade[pick] ? g_rotDue[pick] - g_rotMade[pick] : 0);
+                    g_rotWaitN++;
+                }
                 /* a picture shown clearly later after the one before than the PC made it */
                 u32 src = g_rotSrc[pick];
                 s32 srcGap = (s32)(src - prevSrc);
@@ -3783,8 +3789,11 @@ int main(int argc, char** argv)
                     u32 v = (u32)((now - prevShown + 8) / 17);   /* screen refreshes */
                     g_dispGaps[v < 1 ? 0 : v > 4 ? 3 : v - 1]++;
                 }
-                prevSrc = src;
-                prevShown = now;
+                if (!refine)
+                {
+                    prevSrc = src;
+                    prevShown = now;
+                }
                 g_rotIdx = pick;
                 shownNo = pickNo;
                 newPicture = true;
