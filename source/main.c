@@ -524,15 +524,8 @@ static bool mvdSetup(void)
         return false;
     mvdstdGenerateDefaultConfig(&g_mvdConfig, LINK_H264_WIDTH, LINK_H264_HEIGHT, LINK_H264_WIDTH,
                                 LINK_H264_HEIGHT, NULL, (u32*)g_mvdOut, (u32*)g_mvdOut);
-    /* The colour conversion: libctru's default has the BT.601 TV-range factors (298, 409,
-       208, 100, 516 - i.e. 1.164 Y + 1.596 V ...) but takes Y as it is, without the -16:
-       black was grey with TV range, and with full range everything came out brighter, with
-       the light parts cut off. The PC sends full range: the full-range factors (x256). */
-    g_mvdConfig.unk_x6c[(0x84 - 0x6c) >> 2] = 256;   /* Y */
-    g_mvdConfig.unk_x6c[(0x88 - 0x6c) >> 2] = 359;   /* V -> R: 1.402 */
-    g_mvdConfig.unk_x6c[(0x8c - 0x6c) >> 2] = 183;   /* V -> G: 0.714 */
-    g_mvdConfig.unk_x6c[(0x90 - 0x6c) >> 2] = 88;    /* U -> G: 0.344 */
-    g_mvdConfig.unk_x6c[(0x94 - 0x6c) >> 2] = 454;   /* U -> B: 1.772 */
+    /* the colour conversion stays libctru's default: BT.601 TV range, 1.164 (Y - 16) +
+       1.596 (V - 128) ... - the PC encodes for exactly that (measured, see VIDEOPROBE) */
     g_mvdReady = true;
     return true;
 }
