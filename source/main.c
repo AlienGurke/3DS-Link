@@ -491,6 +491,7 @@ static volatile u64 g_rotDue[ROT_SLOTS];   /* when to show it (osGetTime) */
 static volatile u64 g_rotMade[ROT_SLOTS];  /* when it was decoded */
 static volatile u32 g_rotSrc[ROT_SLOTS];   /* the PC's time of it (0 = unknown) */
 static volatile u32 g_h264Glitched = 0;   /* frames decoded although one before got lost */
+static volatile u32 g_loopSlow = 0;   /* main loop missed a screen refresh */
 static volatile u32 g_rotLate = 0, g_rotStutter = 0, g_rotWaitSum = 0, g_rotWaitN = 0;
 static volatile bool g_rotMode = false;   /* the picture comes as H.264 */
 static bool g_mvdReady = false;
@@ -2042,10 +2043,11 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
     {
         /* H.264 on the 3DS since the last time asked: shown, dropped while waiting for a
            key frame, rebuilt from parity, decoder errors */
-        static u32 last[11];
-        u32 now[11] = { g_h264Shown, g_h264Dropped, g_h264Repaired, g_h264Errors, g_vidOverruns,
-                        g_stallCount, g_stallTotalMs, g_h264Glitched, g_rotLate, g_rotStutter, g_rotWaitN };
-        u32 d[13];
+        static u32 last[12];
+        u32 now[12] = { g_h264Shown, g_h264Dropped, g_h264Repaired, g_h264Errors, g_vidOverruns,
+                        g_stallCount, g_stallTotalMs, g_h264Glitched, g_rotLate, g_rotStutter, g_rotWaitN,
+                        g_loopSlow };
+        u32 d[14];
         for (int i = 0; i < 5; i++) { d[i] = now[i] - last[i]; last[i] = now[i]; }
         d[5] = g_vidRcvBuf;
         d[6] = now[5] - last[5]; last[5] = now[5];
@@ -2060,6 +2062,8 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
         u32 waitSum = g_rotWaitSum;
         d[12] = waitN ? (waitSum - lastWait) / waitN : 0;
         lastWait = waitSum;
+        d[13] = now[11] - last[11];   /* screen refreshes the main loop missed */
+        last[11] = now[11];
         return sendResponse(fd, h, LINK_OK, d, sizeof(d));
     }
 
@@ -3584,6 +3588,12 @@ int main(int argc, char** argv)
 
         /* H.264: the newest decoded picture that is due (a backlog is shown at once) */
         bool newPicture = false;
+        {
+            static u64 lastIter = 0;
+            u64 t = osGetTime();
+            if (lastIter && t - lastIter > 25) g_loopSlow++;
+            lastIter = t;
+        }
         if (g_rotMode)
         {
             static u32 shownNo = 0, prevSrc = 0;
