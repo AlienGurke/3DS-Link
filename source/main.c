@@ -485,6 +485,7 @@ static u8* g_mvdIn = NULL;                /* linear memory: one NAL unit */
 static u8* g_mvdOut = NULL;               /* linear memory: the decoded picture */
 static MVDSTD_Config g_mvdConfig;
 static volatile bool g_h264Reset = false;   /* server thread -> video thread */
+static volatile u32 g_vidOverruns = 0, g_vidRcvBuf = 0;   /* picture packets dropped: decoder behind */
 static volatile u32 g_h264Shown = 0, g_h264Dropped = 0, g_h264Errors = 0, g_h264Repaired = 0;
 
 /* the hardware decoder (New 3DS only); set up once, when the PC asks */
@@ -2025,10 +2026,11 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
     {
         /* H.264 on the 3DS since the last time asked: shown, dropped while waiting for a
            key frame, rebuilt from parity, decoder errors */
-        static u32 last[4];
-        u32 now[4] = { g_h264Shown, g_h264Dropped, g_h264Repaired, g_h264Errors };
-        u32 d[4];
-        for (int i = 0; i < 4; i++) { d[i] = now[i] - last[i]; last[i] = now[i]; }
+        static u32 last[5];
+        u32 now[5] = { g_h264Shown, g_h264Dropped, g_h264Repaired, g_h264Errors, g_vidOverruns };
+        u32 d[6];
+        for (int i = 0; i < 5; i++) { d[i] = now[i] - last[i]; last[i] = now[i]; }
+        d[5] = g_vidRcvBuf;
         return sendResponse(fd, h, LINK_OK, d, sizeof(d));
     }
 
@@ -2680,18 +2682,24 @@ static void h264Packet(const LinkFramePacket* fp, const u8* data, size_t avail)
     }
 }
 
-static void videoThread(void* arg)
+/* ---- the picture packets: one thread only takes them from the socket (quickly, at
+   a high priority, so the small socket buffer never runs over while a frame is
+   decoded), the other decodes them ---- */
+#define VRING 384
+#define VSLOT 1424
+static u8 g_vring[VRING][VSLOT];
+static u16 g_vringLen[VRING];
+static volatile u32 g_vringHead = 0, g_vringTail = 0;   /* written by receiver / decoder */
+
+static void videoRecvThread(void* arg)
 {
     (void)arg;
-    static u8 buf[2048];
-    u32 curFrame = 0;
-    bool frameOpen = false;          /* decoded data not yet shown */
-    bool haveLast = false;
-    u32 lastSeq = 0, baseSeq = 0;
-    u64 lastPresent = 0;
-
-    int burst = 0;
     u32 gen = g_sockGen;
+    {
+        int v = 0;
+        socklen_t l = sizeof(v);
+        if (g_videoFd >= 0 && getsockopt(g_videoFd, SOL_SOCKET, SO_RCVBUF, &v, &l) == 0) g_vidRcvBuf = (u32)v;
+    }
     while (g_running)
     {
         if (gen != g_sockGen)
@@ -2700,13 +2708,59 @@ static void videoThread(void* arg)
             if (g_videoFd >= 0) close(g_videoFd);
             g_videoFd = openUdpSocket(LINK_VIDEO_PORT, 128 * 1024);
         }
-        /* never hog the CPU, however much picture data comes in */
-        if (++burst >= 48) { burst = 0; svcSleepThread(500000); }
         if (g_netPause) { svcSleepThread(20000000); continue; }
         /* big transfer or SD card write: leave the socket service alone, even
            if packets keep coming (they wait in the buffer or get resent) */
         if (g_bulkActive) { svcSleepThread(20000000); continue; }
-        ssize_t n = recvfrom(g_videoFd, buf, sizeof(buf), 0, NULL, NULL);
+        int got = 0;
+        while (got < 64)
+        {
+            u32 head = g_vringHead;
+            u32 next = (head + 1) % VRING;
+            static u8 spill[VSLOT];
+            bool full = next == __atomic_load_n(&g_vringTail, __ATOMIC_ACQUIRE);
+            u8* dst = full ? spill : g_vring[head];
+            ssize_t n = recvfrom(g_videoFd, dst, VSLOT, 0, NULL, NULL);
+            if (n <= 0) break;
+            got++;
+            if ((size_t)n >= sizeof(LinkFramePacket))
+            {
+                /* receipts at once, not only after decoding */
+                LinkFramePacket fp;
+                memcpy(&fp, dst, sizeof(fp));
+                if (fp.magic == LINK_H264_MAGIC || fp.magic == LINK_FRAME_MAGIC) noteVideoSeq(fp.seq);
+                g_lastVideoTime = osGetTime();
+            }
+            if (full) { g_vidOverruns++; continue; }   /* the decoder is far behind */
+            g_vringLen[head] = (u16)n;
+            __atomic_store_n(&g_vringHead, next, __ATOMIC_RELEASE);
+        }
+        /* nothing (more) there: sleep in our own thread (never block inside the
+           shared socket service, see sendAll) */
+        if (got == 0) svcSleepThread(500000);   /* 0.5 ms */
+    }
+}
+
+static void videoThread(void* arg)
+{
+    (void)arg;
+    static u8 buf[VSLOT];
+    u32 curFrame = 0;
+    bool frameOpen = false;          /* decoded data not yet shown */
+    bool haveLast = false;
+    u32 lastSeq = 0, baseSeq = 0;
+    u64 lastPresent = 0;
+
+    while (g_running)
+    {
+        ssize_t n = 0;
+        u32 tail = g_vringTail;
+        if (tail != __atomic_load_n(&g_vringHead, __ATOMIC_ACQUIRE))
+        {
+            n = g_vringLen[tail];
+            memcpy(buf, g_vring[tail], (size_t)n);
+            __atomic_store_n(&g_vringTail, (tail + 1) % VRING, __ATOMIC_RELEASE);
+        }
         if (n <= 0)
         {
             /* safety net: never freeze, even if consistency cannot be reached */
@@ -2716,9 +2770,6 @@ static void videoThread(void* arg)
                 frameOpen = false;
                 lastPresent = osGetTime();
             }
-            /* nothing there: sleep in our own thread (never block inside the
-               shared socket service, see sendAll). During big transfers no
-               picture comes anyway, so check rarely. */
             svcSleepThread(g_bulkActive ? 20000000 : 1000000);   /* 20 ms / 1 ms */
             continue;
         }
@@ -2727,8 +2778,6 @@ static void videoThread(void* arg)
         memcpy(&fp, buf, sizeof(fp));
         if (fp.magic == LINK_H264_MAGIC)
         {
-            noteVideoSeq(fp.seq);
-            g_lastVideoTime = osGetTime();
             if (g_mvdReady) h264Packet(&fp, buf + sizeof(fp), (size_t)n - sizeof(fp));
             continue;
         }
@@ -2763,9 +2812,7 @@ static void videoThread(void* arg)
             decodeTile(type, p, (idx % tilesX) * 8, (idx / tilesX) * 8, vw);
             p += size;
         }
-        noteVideoSeq(fp.seq);
         markReceived(fp.seq);
-        g_lastVideoTime = osGetTime();
 
         if (fp.flags & LINK_FRAME_LAST)
         {
@@ -3364,6 +3411,9 @@ int main(int argc, char** argv)
        (waiting for the screen), so they still get plenty of time. */
     Thread inp = threadCreate(inputThread, NULL, 0x4000, prio - 2, -2, false);
     Thread vid = threadCreate(videoThread, NULL, 0x4000, prio + 1, -2, false);
+    /* taking packets from the socket is tiny work: above the main thread, so the
+       socket buffer is emptied even while the main thread or the decoder is busy */
+    Thread vrx = threadCreate(videoRecvThread, NULL, 0x4000, prio - 1, -2, false);
     Thread srv = threadCreate(serverThread, NULL, 0x4000, prio + 1, -2, false);
 
     u32 lastVideoFrames = (u32)-1;
@@ -4077,11 +4127,13 @@ int main(int argc, char** argv)
     close(g_listenFd);
     threadJoin(inp, U64_MAX);
     threadJoin(vid, U64_MAX);
+    threadJoin(vrx, U64_MAX);
     /* a blocking send could still be waiting for the PC: give it 2 s, then
        socExit() below tears the sockets down anyway */
     threadJoin(srv, 2000000000LL);
     threadFree(inp);
     threadFree(vid);
+    threadFree(vrx);
     threadFree(srv);
     close(g_udpFd);
     close(g_videoFd);
