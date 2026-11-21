@@ -496,9 +496,18 @@ static volatile int g_tosResult = -1;   /* input packets' WiFi priority: 0 = set
 static volatile u32 g_tileRebuilt = 0;
 /* input round trip (3DS -> PC -> 3DS): when each input packet went out, and the results */
 static volatile u64 g_inSentTick[256];
-static volatile u32 g_rttCount = 0, g_rttSumUs = 0, g_rttMaxUs = 0;   /* tile packets rebuilt from parity */
+static volatile u32 g_rttCount = 0, g_rttSumUs = 0, g_rttMaxUs = 0;
+/* picture delay: PC clock - 3DS clock (best sample: shortest round trip), PC clock - picture
+   time stamps, and the results (from the PC having a picture to it being on the screen) */
+static volatile u32 g_clockOff = 0, g_emuOff = 0;
+static volatile bool g_clockKnown = false;
+static u32 g_clockBestRtt = 0xFFFFFFFF;
+static u64 g_clockBestAt = 0;
+static volatile u32 g_lagCount = 0, g_lagSum = 0, g_lagMax = 0;
+static inline u32 tickMs(void) { return (u32)(svcGetSystemTick() / (SYSCLOCK_ARM11 / 1000)); }   /* tile packets rebuilt from parity */
 static volatile u32 g_tileShown = 0, g_tileForced = 0;   /* tiles: pictures shown, by the 250 ms safety net */
 static u64 g_vblankTime = 0;   /* when the last screen refresh began (main loop) */
+static u32 g_vblankTickMs = 0; /* the same, in tickMs() */
 /* while it moves: how many screen refreshes each picture stood (1, 2, 3, 4+) */
 static volatile u32 g_dispGaps[4];
 static volatile u32 g_rotLate = 0, g_rotStutter = 0, g_rotWaitSum = 0, g_rotWaitN = 0;
@@ -2054,12 +2063,13 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
     {
         /* H.264 on the 3DS since the last time asked: shown, dropped while waiting for a
            key frame, rebuilt from parity, decoder errors */
-        static u32 last[21];
-        u32 now[21] = { g_h264Shown, g_h264Dropped, g_h264Repaired, g_h264Errors, g_vidOverruns,
+        static u32 last[23];
+        u32 now[23] = { g_h264Shown, g_h264Dropped, g_h264Repaired, g_h264Errors, g_vidOverruns,
                         g_stallCount, g_stallTotalMs, g_h264Glitched, g_rotLate, g_rotStutter, g_rotWaitN,
                         g_loopSlow, g_dispGaps[0], g_dispGaps[1], g_dispGaps[2], g_dispGaps[3],
-                        g_tileShown, g_tileForced, g_tileRebuilt, g_rttCount, g_rttSumUs };
-        u32 d[24];
+                        g_tileShown, g_tileForced, g_tileRebuilt, g_rttCount, g_rttSumUs,
+                        g_lagCount, g_lagSum };
+        u32 d[27];
         for (int i = 0; i < 5; i++) { d[i] = now[i] - last[i]; last[i] = now[i]; }
         d[5] = g_vidRcvBuf;
         d[6] = now[5] - last[5]; last[5] = now[5];
@@ -2084,6 +2094,13 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
         last[20] = now[20];
         d[23] = g_rttMaxUs;
         g_rttMaxUs = 0;
+        /* picture delay PC -> 3DS screen: count, average and longest in ms */
+        d[24] = now[21] - last[21];
+        d[25] = d[24] ? (now[22] - last[22]) / d[24] : 0;
+        last[21] = now[21];
+        last[22] = now[22];
+        d[26] = g_lagMax;
+        g_lagMax = 0;
         return sendResponse(fd, h, LINK_OK, d, sizeof(d));
     }
 
@@ -2914,20 +2931,37 @@ static void videoRecvThread(void* arg)
             ssize_t n = recvfrom(g_videoFd, dst, VSLOT, 0, NULL, NULL);
             if (n <= 0) break;
             got++;
-            if (n == 8)
+            if (n == 8 || n == 16)
             {
                 /* the PC's echo of an input packet: how long the round trip took */
-                u32 msg[2];
-                memcpy(msg, dst, 8);
+                u32 msg[4];
+                memcpy(msg, dst, (size_t)n);
                 if (msg[0] == LINK_ECHO_MAGIC)
                 {
                     u64 sent = g_inSentTick[msg[1] & 255];
-                    u64 us = sent ? (svcGetSystemTick() - sent) * 1000000ULL / SYSCLOCK_ARM11 : 0;
+                    u64 nowT = svcGetSystemTick();
+                    u64 us = sent ? (nowT - sent) * 1000000ULL / SYSCLOCK_ARM11 : 0;
                     if (sent && us < 2000000)
                     {
                         g_rttCount++;
                         g_rttSumUs += (u32)us;
                         if (us > g_rttMaxUs) g_rttMaxUs = (u32)us;
+                        if (n == 16)
+                        {
+                            /* the PC's clock at about half the round trip: their offset. The
+                               quickest round trip of the last seconds is the most exact */
+                            u32 rtt = (u32)(us / 1000);
+                            u64 nowMs = nowT / (SYSCLOCK_ARM11 / 1000);
+                            if (rtt <= g_clockBestRtt || nowMs - g_clockBestAt > 5000)
+                            {
+                                g_clockBestRtt = rtt;
+                                g_clockBestAt = nowMs;
+                                u32 sentMs = (u32)(sent / (SYSCLOCK_ARM11 / 1000));
+                                g_clockOff = msg[2] - (sentMs + rtt / 2);
+                                g_clockKnown = true;
+                            }
+                            g_emuOff = msg[3];
+                        }
                     }
                     continue;
                 }
@@ -3883,6 +3917,20 @@ int main(int argc, char** argv)
                 {
                     prevSrc = src;
                     prevShown = now;
+                    /* how long after the PC had this picture it shows: it is drawn now and
+                       appears with the next refresh (~17 ms) */
+                    if (src && g_clockKnown)
+                    {
+                        u32 pcHad = src + g_emuOff;                       /* PC clock */
+                        u32 shown = g_vblankTickMs + 17 + g_clockOff;     /* PC clock */
+                        s32 lag = (s32)(shown - pcHad);
+                        if (lag > 0 && lag < 2000)
+                        {
+                            g_lagCount++;
+                            g_lagSum += (u32)lag;
+                            if ((u32)lag > g_lagMax) g_lagMax = (u32)lag;
+                        }
+                    }
                 }
                 g_rotIdx = pick;
                 shownNo = pickNo;
@@ -4537,6 +4585,7 @@ int main(int argc, char** argv)
         gfxSwapBuffers();
         gspWaitForVBlank();
         g_vblankTime = osGetTime();
+        g_vblankTickMs = tickMs();
     }
 
     g_running = false;
