@@ -495,7 +495,7 @@ static volatile u32 g_loopSlow = 0;
 static volatile u32 g_tileShown = 0, g_tileForced = 0;   /* tiles: pictures shown, by the 250 ms safety net */
 static u64 g_vblankTime = 0;   /* when the last screen refresh began (main loop) */
 /* while it moves: how many screen refreshes each picture stood (1, 2, 3, 4+) */
-static volatile u32 g_dispGaps[4];   /* main loop missed a screen refresh */
+static volatile u32 g_dispGaps[4];
 static volatile u32 g_rotLate = 0, g_rotStutter = 0, g_rotWaitSum = 0, g_rotWaitN = 0;
 static volatile bool g_rotMode = false;   /* the picture comes as H.264 */
 static bool g_mvdReady = false;
@@ -524,6 +524,15 @@ static bool mvdSetup(void)
         return false;
     mvdstdGenerateDefaultConfig(&g_mvdConfig, LINK_H264_WIDTH, LINK_H264_HEIGHT, LINK_H264_WIDTH,
                                 LINK_H264_HEIGHT, NULL, (u32*)g_mvdOut, (u32*)g_mvdOut);
+    /* The colour conversion: libctru's default has the BT.601 TV-range factors (298, 409,
+       208, 100, 516 - i.e. 1.164 Y + 1.596 V ...) but takes Y as it is, without the -16:
+       black was grey with TV range, and with full range everything came out brighter, with
+       the light parts cut off. The PC sends full range: the full-range factors (x256). */
+    g_mvdConfig.unk_x6c[(0x84 - 0x6c) >> 2] = 256;   /* Y */
+    g_mvdConfig.unk_x6c[(0x88 - 0x6c) >> 2] = 359;   /* V -> R: 1.402 */
+    g_mvdConfig.unk_x6c[(0x8c - 0x6c) >> 2] = 183;   /* V -> G: 0.714 */
+    g_mvdConfig.unk_x6c[(0x90 - 0x6c) >> 2] = 88;    /* U -> G: 0.344 */
+    g_mvdConfig.unk_x6c[(0x94 - 0x6c) >> 2] = 454;   /* U -> B: 1.772 */
     g_mvdReady = true;
     return true;
 }
