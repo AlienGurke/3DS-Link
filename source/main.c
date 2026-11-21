@@ -2103,7 +2103,7 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
         linkGfInit();
         /* then (newer apps) whether the input packets got the WiFi priority (0 = yes) */
         u32 caps[2] = { (mvdSetup() ? (LINK_VIDCAP_H264 | LINK_VIDCAP_H264_RS) : 0) |
-                            LINK_VIDCAP_TILE_RS | LINK_VIDCAP_TILE_TS | LINK_VIDCAP_ECHO,
+                            LINK_VIDCAP_TILE_RS | LINK_VIDCAP_TILE_TS | LINK_VIDCAP_ECHO | LINK_VIDCAP_TILE_LZ4,
                         (u32)g_tosResult };
         return sendResponse(fd, h, LINK_OK, caps, sizeof(caps));
     }
@@ -2930,7 +2930,8 @@ static void videoRecvThread(void* arg)
                 /* receipts at once, not only after decoding */
                 LinkFramePacket fp;
                 memcpy(&fp, dst, sizeof(fp));
-                if (fp.magic == LINK_H264_MAGIC || fp.magic == LINK_FRAME_MAGIC) noteVideoSeq(fp.seq);
+                if (fp.magic == LINK_H264_MAGIC || fp.magic == LINK_FRAME_MAGIC || fp.magic == LINK_FRAMEZ_MAGIC)
+                    noteVideoSeq(fp.seq);
                 g_lastVideoTime = osGetTime();
             }
             if (full) { g_vidOverruns++; continue; }   /* the decoder is far behind */
@@ -3022,6 +3023,29 @@ static void tileData(const u8* buf, size_t n)
     }
 }
 
+/* a packet of tiles, packed (LINK_FRAMEZ_MAGIC) or not */
+static void tileDataAny(const u8* buf, size_t n)
+{
+    LinkFramePacket fp;
+    memcpy(&fp, buf, sizeof(fp));
+    if (fp.magic != LINK_FRAMEZ_MAGIC)
+    {
+        tileData(buf, n);
+        return;
+    }
+    static u8 un[sizeof(LinkFramePacket) + 4096];
+    if (n < sizeof(fp) + 2) return;
+    u16 rawLen;
+    memcpy(&rawLen, buf + sizeof(fp), 2);
+    if (rawLen > 4096) return;
+    int got = LZ4_decompress_safe((const char*)buf + sizeof(fp) + 2, (char*)un + sizeof(fp),
+                                  (int)(n - sizeof(fp) - 2), 4096);
+    if (got != (int)rawLen) return;
+    fp.magic = LINK_FRAME_MAGIC;
+    memcpy(un, &fp, sizeof(fp));
+    tileData(un, sizeof(fp) + (size_t)got);
+}
+
 /* packets of the current frame got lost: rebuild them from the parity if it suffices */
 static void tileRepair(u32 seqBase)
 {
@@ -3034,11 +3058,12 @@ static void tileRepair(u32 seqBase)
         LinkFramePacket fp;
         memcpy(&fp, pk, sizeof(fp));
         /* a sane packet of this frame (else the parity was not for these packets) */
-        if (fp.magic != LINK_FRAME_MAGIC || fp.frameId != g_tpFrame || fp.seq != seqBase + (u32)rebuilt[c])
+        if ((fp.magic != LINK_FRAME_MAGIC && fp.magic != LINK_FRAMEZ_MAGIC) || fp.frameId != g_tpFrame ||
+            fp.seq != seqBase + (u32)rebuilt[c])
             continue;
         g_tileRebuilt++;
         noteVideoSeq(fp.seq);   /* confirmed as if it had arrived */
-        tileData(pk, LINK_FRAME_MAX_BYTES);
+        tileDataAny(pk, LINK_FRAME_MAX_BYTES);
     }
 }
 
@@ -3097,7 +3122,7 @@ static void videoThread(void* arg)
             tileRepair(fp.seq);
             continue;
         }
-        if (fp.magic != LINK_FRAME_MAGIC) continue;
+        if (fp.magic != LINK_FRAME_MAGIC && fp.magic != LINK_FRAMEZ_MAGIC) continue;
         g_rotMode = false;   /* tiles again */
 
         /* keep it for a repair of the frame */
@@ -3111,7 +3136,7 @@ static void videoThread(void* arg)
             memset(dst + n, 0, LINK_FRAME_MAX_BYTES - (size_t)n);
             g_tpHave[idx] = 1;
         }
-        tileData(buf, (size_t)n);
+        tileDataAny(buf, (size_t)n);
         if (fp.frameId == g_tpFrame) tileRepair(fp.seq - idx);
     }
 }
