@@ -492,6 +492,7 @@ static volatile u64 g_rotMade[ROT_SLOTS];  /* when it was decoded */
 static volatile u32 g_rotSrc[ROT_SLOTS];   /* the PC's time of it (0 = unknown) */
 static volatile u32 g_h264Glitched = 0;   /* frames decoded although one before got lost */
 static volatile u32 g_loopSlow = 0;
+static volatile u32 g_tileRebuilt = 0;   /* tile packets rebuilt from parity */
 static volatile u32 g_tileShown = 0, g_tileForced = 0;   /* tiles: pictures shown, by the 250 ms safety net */
 static u64 g_vblankTime = 0;   /* when the last screen refresh began (main loop) */
 /* while it moves: how many screen refreshes each picture stood (1, 2, 3, 4+) */
@@ -2049,12 +2050,12 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
     {
         /* H.264 on the 3DS since the last time asked: shown, dropped while waiting for a
            key frame, rebuilt from parity, decoder errors */
-        static u32 last[18];
-        u32 now[18] = { g_h264Shown, g_h264Dropped, g_h264Repaired, g_h264Errors, g_vidOverruns,
+        static u32 last[19];
+        u32 now[19] = { g_h264Shown, g_h264Dropped, g_h264Repaired, g_h264Errors, g_vidOverruns,
                         g_stallCount, g_stallTotalMs, g_h264Glitched, g_rotLate, g_rotStutter, g_rotWaitN,
                         g_loopSlow, g_dispGaps[0], g_dispGaps[1], g_dispGaps[2], g_dispGaps[3],
-                        g_tileShown, g_tileForced };
-        u32 d[20];
+                        g_tileShown, g_tileForced, g_tileRebuilt };
+        u32 d[21];
         for (int i = 0; i < 5; i++) { d[i] = now[i] - last[i]; last[i] = now[i]; }
         d[5] = g_vidRcvBuf;
         d[6] = now[5] - last[5]; last[5] = now[5];
@@ -2071,7 +2072,7 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
         lastWait = waitSum;
         d[13] = now[11] - last[11];   /* screen refreshes the main loop missed */
         last[11] = now[11];
-        for (int i = 12; i < 18; i++) { d[i + 2] = now[i] - last[i]; last[i] = now[i]; }
+        for (int i = 12; i < 19; i++) { d[i + 2] = now[i] - last[i]; last[i] = now[i]; }
         return sendResponse(fd, h, LINK_OK, d, sizeof(d));
     }
 
@@ -2089,7 +2090,8 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
     case LINK_CMD_VIDEOCAPS:
     {
         linkGfInit();
-        u32 caps = mvdSetup() ? (LINK_VIDCAP_H264 | LINK_VIDCAP_H264_RS) : 0;
+        u32 caps = (mvdSetup() ? (LINK_VIDCAP_H264 | LINK_VIDCAP_H264_RS) : 0) |
+                   LINK_VIDCAP_TILE_RS | LINK_VIDCAP_TILE_TS;
         return sendResponse(fd, h, LINK_OK, &caps, sizeof(caps));
     }
 
@@ -2481,6 +2483,7 @@ static int tilePayloadSize(int type)
     case LINK_TILE_PAL16: return 64;
     case LINK_TILE_HALF: return 32;
     case LINK_TILE_QUARTER: return 8;
+    case LINK_TILE_META: return 4;
     default: return -1;
     }
 }
@@ -2490,13 +2493,23 @@ static int tilePayloadSize(int type)
 void link_test_on_present(const u16* img);   /* only for the PC simulation */
 #endif
 
+static u32 g_tileTs = 0;   /* the PC's time of the tile picture being received (0 = none) */
+static u64 rotDue(u32 ts, u64 now);
 static void presentFrame(void)
 {
-    memcpy(g_dsImage, g_dsBack, sizeof(g_dsImage));
+    /* into the same ring as the H.264 pictures: the main loop shows it when due */
+    u32 no = g_rotWritten + 1;
+    int slot = (int)(no % ROT_SLOTS);
+    u64 now = osGetTime();
+    memcpy(g_rotImage[slot], g_dsBack, sizeof(g_dsBack));
+    g_rotMade[slot] = now;
+    g_rotDue[slot] = rotDue(g_tileTs, now);
+    g_rotSrc[slot] = g_tileTs;
+    __sync_synchronize();
+    g_rotWritten = no;
     g_tileShown++;
-    g_videoFrames++;
 #ifdef LINK_HOST_TEST
-    link_test_on_present(g_dsImage);
+    link_test_on_present(g_dsBack);
 #endif
 }
 
@@ -2630,19 +2643,23 @@ static u32 g_h264LastLen = 0, g_h264SeqBase = 0;
 static bool g_h264SeqKnown = false;
 
 /* Reed-Solomon: rebuild up to m missing data packets from the parity packets */
-static void h264Repair(void)
+/* Reed-Solomon (see LinkProto.h): rebuilds missing data packets 0..k-1 (`part` bytes each,
+   in buf, have[i] = 0 if missing) from the parity rows that arrived. Returns how many it
+   rebuilt (their indices in `rebuilt`), 0 if there is not enough parity yet. */
+#define RS_MAX_ROWS 15
+static int rsRebuild(u8* buf, int part, u8* have, int k, const u8* par, const bool* parHave, int m,
+                     int* rebuilt)
 {
-    int k = g_h264Total, m = g_h264Groups;
-    if (m <= 0 || k <= 0 || k > H264_MAX_PARTS) return;
-    int miss[H264_MAX_GROUPS], rows[H264_MAX_GROUPS], e = 0, r = 0;
+    if (m <= 0 || m > RS_MAX_ROWS || k <= 0) return 0;
+    int miss[RS_MAX_ROWS], rows[RS_MAX_ROWS], e = 0, r = 0;
     for (int i = 0; i < k; i++)
-        if (!g_h264Have[i]) { if (e == H264_MAX_GROUPS) return; miss[e++] = i; }
+        if (!have[i]) { if (e == RS_MAX_ROWS) return 0; miss[e++] = i; }
     for (int j = 0; j < m && r < e; j++)
-        if (g_h264ParHave[j]) rows[r++] = j;
-    if (e == 0 || r < e) return;   /* not enough parity yet */
+        if (parHave[j]) rows[r++] = j;
+    if (e == 0 || r < e) return 0;   /* not enough parity yet */
 
     /* A[r][c] = coefficient of missing packet c in parity row r; invert it */
-    u8 A[H264_MAX_GROUPS][2 * H264_MAX_GROUPS];
+    u8 A[RS_MAX_ROWS][2 * RS_MAX_ROWS];
     for (int i = 0; i < e; i++)
         for (int c = 0; c < 2 * e; c++)
             A[i][c] = c < e ? linkCauchy(rows[i], miss[c], m) : (c - e == i);
@@ -2650,7 +2667,7 @@ static void h264Repair(void)
     {
         int p = c;
         while (p < e && !A[p][c]) p++;
-        if (p == e) return;   /* cannot happen with a Cauchy matrix */
+        if (p == e) return 0;   /* cannot happen with a Cauchy matrix */
         if (p != c)
             for (int x = 0; x < 2 * e; x++) { u8 t = A[p][x]; A[p][x] = A[c][x]; A[c][x] = t; }
         u8 inv = linkGfInv(A[c][c]);
@@ -2663,37 +2680,50 @@ static void h264Repair(void)
         }
     }
     /* syndromes: parity minus what the packets that arrived contribute */
-    static u8 syn[H264_MAX_GROUPS][LINK_H264_PART];
+    static u8 syn[RS_MAX_ROWS][LINK_FRAME_MAX_BYTES];
     u8 tab[256];
     for (int i = 0; i < e; i++)
     {
-        memcpy(syn[i], g_h264Par[rows[i]], LINK_H264_PART);
+        memcpy(syn[i], par + (size_t)rows[i] * part, (size_t)part);
         for (int d = 0; d < k; d++)
         {
-            if (!g_h264Have[d]) continue;
+            if (!have[d]) continue;
             u8 c = linkCauchy(rows[i], d, m);
             for (int x = 0; x < 256; x++) tab[x] = linkGfMul(c, (u8)x);
-            const u8* src = g_h264Buf + d * LINK_H264_PART;
-            for (int b = 0; b < LINK_H264_PART; b++) syn[i][b] ^= tab[src[b]];
+            const u8* src = buf + (size_t)d * part;
+            for (int b = 0; b < part; b++) syn[i][b] ^= tab[src[b]];
         }
     }
     /* missing packet c = sum over r of inverse[c][r] * syndrome r */
     for (int c = 0; c < e; c++)
     {
-        u8* dst = g_h264Buf + miss[c] * LINK_H264_PART;
-        memset(dst, 0, LINK_H264_PART);
+        u8* dst = buf + (size_t)miss[c] * part;
+        memset(dst, 0, (size_t)part);
         for (int i = 0; i < e; i++)
         {
             u8 f = A[c][e + i];
             if (!f) continue;
             for (int x = 0; x < 256; x++) tab[x] = linkGfMul(f, (u8)x);
-            for (int b = 0; b < LINK_H264_PART; b++) dst[b] ^= tab[syn[i][b]];
+            for (int b = 0; b < part; b++) dst[b] ^= tab[syn[i][b]];
         }
-        g_h264Have[miss[c]] = 1;
+        have[miss[c]] = 1;
+        rebuilt[c] = miss[c];
+    }
+    return e;
+}
+
+static void h264Repair(void)
+{
+    int k = g_h264Total, m = g_h264Groups;
+    if (m <= 0 || k <= 0 || k > H264_MAX_PARTS) return;
+    int rebuilt[RS_MAX_ROWS];
+    int e = rsRebuild(g_h264Buf, LINK_H264_PART, g_h264Have, k, &g_h264Par[0][0], g_h264ParHave, m, rebuilt);
+    for (int c = 0; c < e; c++)
+    {
         g_h264Got++;
         g_h264Repaired++;
-        if (miss[c] == k - 1) g_h264Size = (u32)miss[c] * LINK_H264_PART + g_h264LastLen;
-        if (g_h264SeqKnown) noteVideoSeq(g_h264SeqBase + (u32)miss[c]);   /* as if it arrived */
+        if (rebuilt[c] == k - 1) g_h264Size = (u32)rebuilt[c] * LINK_H264_PART + g_h264LastLen;
+        if (g_h264SeqKnown) noteVideoSeq(g_h264SeqBase + (u32)rebuilt[c]);   /* as if it arrived */
     }
 }
 
@@ -2865,15 +2895,109 @@ static void videoRecvThread(void* arg)
     }
 }
 
+/* ---- tiles: a frame's packets, kept for the Reed-Solomon repair ---- */
+static u8 g_tpBuf[LINK_TILE_MAX_PACKETS * LINK_FRAME_MAX_BYTES];
+static u8 g_tpHave[LINK_TILE_MAX_PACKETS];
+static u8 g_tpPar[LINK_TILE_MAX_PARITY * LINK_FRAME_MAX_BYTES];
+static bool g_tpParHave[LINK_TILE_MAX_PARITY];
+static u32 g_tpFrame = 0;
+static int g_tpK = -1, g_tpM = 0;
+/* the frame being put together */
+static u32 g_tfCur = 0;
+static bool g_tfOpen = false, g_tfHaveLast = false;
+static u32 g_tfLastSeq = 0, g_tfBaseSeq = 0;
+static u64 g_tfLastPresent = 0;
+
+static void tpReset(u32 frameId)
+{
+    g_tpFrame = frameId;
+    g_tpK = -1;
+    g_tpM = 0;
+    memset(g_tpHave, 0, sizeof(g_tpHave));
+    memset(g_tpParHave, 0, sizeof(g_tpParHave));
+}
+
+/* one packet of tiles (arrived, or rebuilt): draw it, and show the frame once consistent */
+static void tileData(const u8* buf, size_t n)
+{
+    LinkFramePacket fp;
+    memcpy(&fp, buf, sizeof(fp));
+    if (fp.frameId != g_tfCur)
+    {
+        /* a frame that never became consistent is simply not shown;
+           its lost parts are repeated in a later frame */
+        g_tfCur = fp.frameId;
+        g_tfHaveLast = false;
+    }
+    if (g_tfLastPresent == 0) g_tfLastPresent = osGetTime();
+    g_tfOpen = true;
+
+    const u8* p = buf + sizeof(fp);
+    const u8* end = buf + n;
+    /* read the size once: it may change (other emulator) while we decode */
+    const int vw = g_vidW, vh = g_vidH;
+    const int tilesX = vw / 8, tilesY = vh / 8;
+    for (u32 e = 0; e < fp.entryCount; e++)
+    {
+        if (p + 2 > end) break;
+        u16 head;
+        memcpy(&head, p, 2);
+        p += 2;
+        int idx = head & LINK_TILE_INDEX_MASK;
+        int type = head >> LINK_TILE_TYPE_SHIFT;
+        int size = tilePayloadSize(type);
+        if (size < 0 || p + size > end) break;
+        if (type == LINK_TILE_META)
+        {
+            if (idx == 0) memcpy(&g_tileTs, p, 4);   /* when the PC made the picture */
+            p += size;
+            continue;
+        }
+        if (idx >= tilesX * tilesY) break;
+        decodeTile(type, p, (idx % tilesX) * 8, (idx / tilesX) * 8, vw);
+        p += size;
+    }
+    markReceived(fp.seq);
+
+    if (fp.flags & LINK_FRAME_LAST)
+    {
+        g_tfHaveLast = true;
+        g_tfLastSeq = fp.seq;
+        g_tfBaseSeq = fp.baseSeq;
+    }
+    if (g_tfHaveLast && haveAll(g_tfBaseSeq, g_tfLastSeq))
+    {
+        presentFrame();
+        g_tfOpen = false;
+        g_tfHaveLast = false;
+        g_tfLastPresent = osGetTime();
+    }
+}
+
+/* packets of the current frame got lost: rebuild them from the parity if it suffices */
+static void tileRepair(u32 seqBase)
+{
+    if (g_tpK <= 0 || g_tpM <= 0) return;
+    int rebuilt[RS_MAX_ROWS];
+    int e = rsRebuild(g_tpBuf, LINK_FRAME_MAX_BYTES, g_tpHave, g_tpK, g_tpPar, g_tpParHave, g_tpM, rebuilt);
+    for (int c = 0; c < e; c++)
+    {
+        const u8* pk = g_tpBuf + (size_t)rebuilt[c] * LINK_FRAME_MAX_BYTES;
+        LinkFramePacket fp;
+        memcpy(&fp, pk, sizeof(fp));
+        /* a sane packet of this frame (else the parity was not for these packets) */
+        if (fp.magic != LINK_FRAME_MAGIC || fp.frameId != g_tpFrame || fp.seq != seqBase + (u32)rebuilt[c])
+            continue;
+        g_tileRebuilt++;
+        noteVideoSeq(fp.seq);   /* confirmed as if it had arrived */
+        tileData(pk, LINK_FRAME_MAX_BYTES);
+    }
+}
+
 static void videoThread(void* arg)
 {
     (void)arg;
     static u8 buf[VSLOT];
-    u32 curFrame = 0;
-    bool frameOpen = false;          /* decoded data not yet shown */
-    bool haveLast = false;
-    u32 lastSeq = 0, baseSeq = 0;
-    u64 lastPresent = 0;
 
     while (g_running)
     {
@@ -2888,12 +3012,12 @@ static void videoThread(void* arg)
         if (n <= 0)
         {
             /* safety net: never freeze, even if consistency cannot be reached */
-            if (frameOpen && osGetTime() - lastPresent > 250)
+            if (g_tfOpen && osGetTime() - g_tfLastPresent > 250)
             {
                 g_tileForced++;
                 presentFrame();
-                frameOpen = false;
-                lastPresent = osGetTime();
+                g_tfOpen = false;
+                g_tfLastPresent = osGetTime();
             }
             svcSleepThread(g_bulkActive ? 20000000 : 1000000);   /* 20 ms / 1 ms */
             continue;
@@ -2906,52 +3030,41 @@ static void videoThread(void* arg)
             if (g_mvdReady) h264Packet(&fp, buf + sizeof(fp), (size_t)n - sizeof(fp));
             continue;
         }
+        if (fp.magic == LINK_TILEPAR_MAGIC)
+        {
+            /* parity for the tiles of frame fp.frameId */
+            int k = (int)((fp.baseSeq >> 8) & 0xFFFF), m = (int)((fp.baseSeq >> 4) & 0xF), j = (int)(fp.baseSeq & 0xF);
+            if (k <= 0 || k > LINK_TILE_MAX_PACKETS || m <= 0 || m > LINK_TILE_MAX_PARITY || j >= m ||
+                (size_t)n < sizeof(fp) + LINK_FRAME_MAX_BYTES)
+                continue;
+            if (fp.frameId != g_tpFrame)
+            {
+                if ((s32)(fp.frameId - g_tpFrame) < 0 && g_tpFrame != 0) continue;   /* an older frame */
+                tpReset(fp.frameId);
+            }
+            g_tpK = k;
+            g_tpM = m;
+            memcpy(g_tpPar + (size_t)j * LINK_FRAME_MAX_BYTES, buf + sizeof(fp), LINK_FRAME_MAX_BYTES);
+            g_tpParHave[j] = true;
+            tileRepair(fp.seq);
+            continue;
+        }
         if (fp.magic != LINK_FRAME_MAGIC) continue;
         g_rotMode = false;   /* tiles again */
 
-        if (fp.frameId != curFrame)
+        /* keep it for a repair of the frame */
+        u32 idx = (fp.flags & 0x7FFF) >> LINK_FRAME_INDEX_SHIFT;
+        if (fp.frameId != g_tpFrame && (s32)(fp.frameId - g_tpFrame) > 0) tpReset(fp.frameId);
+        else if (fp.frameId != g_tpFrame && g_tpFrame == 0) tpReset(fp.frameId);
+        if (fp.frameId == g_tpFrame && idx < LINK_TILE_MAX_PACKETS && (size_t)n <= LINK_FRAME_MAX_BYTES)
         {
-            /* a frame that never became consistent is simply not shown;
-               its lost parts are repeated in a later frame */
-            curFrame = fp.frameId;
-            haveLast = false;
+            u8* dst = g_tpBuf + (size_t)idx * LINK_FRAME_MAX_BYTES;
+            memcpy(dst, buf, (size_t)n);
+            memset(dst + n, 0, LINK_FRAME_MAX_BYTES - (size_t)n);
+            g_tpHave[idx] = 1;
         }
-        if (lastPresent == 0) lastPresent = osGetTime();
-        frameOpen = true;
-
-        const u8* p = buf + sizeof(fp);
-        const u8* end = buf + n;
-        /* read the size once: it may change (other emulator) while we decode */
-        const int vw = g_vidW, vh = g_vidH;
-        const int tilesX = vw / 8, tilesY = vh / 8;
-        for (u32 e = 0; e < fp.entryCount; e++)
-        {
-            if (p + 2 > end) break;
-            u16 head;
-            memcpy(&head, p, 2);
-            p += 2;
-            int idx = head & LINK_TILE_INDEX_MASK;
-            int type = head >> LINK_TILE_TYPE_SHIFT;
-            int size = tilePayloadSize(type);
-            if (idx >= tilesX * tilesY || size < 0 || p + size > end) break;
-            decodeTile(type, p, (idx % tilesX) * 8, (idx / tilesX) * 8, vw);
-            p += size;
-        }
-        markReceived(fp.seq);
-
-        if (fp.flags & LINK_FRAME_LAST)
-        {
-            haveLast = true;
-            lastSeq = fp.seq;
-            baseSeq = fp.baseSeq;
-        }
-        if (haveLast && haveAll(baseSeq, lastSeq))
-        {
-            presentFrame();
-            frameOpen = false;
-            haveLast = false;
-            lastPresent = osGetTime();
-        }
+        tileData(buf, (size_t)n);
+        if (fp.frameId == g_tpFrame) tileRepair(fp.seq - idx);
     }
 }
 
@@ -3620,7 +3733,7 @@ int main(int argc, char** argv)
             if (lastIter && t - lastIter > 25) g_loopSlow++;
             lastIter = t;
         }
-        if (g_rotMode)
+        /* both H.264 and tiles: decoded pictures wait in the ring until they are due */
         {
             static u32 shownNo = 0, prevSrc = 0;
             static u64 prevShown = 0;
@@ -3675,20 +3788,8 @@ int main(int argc, char** argv)
                 g_rotIdx = pick;
                 shownNo = pickNo;
                 newPicture = true;
+                if (!g_rotMode) memcpy(g_dsImage, g_rotImage[pick], sizeof(g_dsImage));   /* tiles */
             }
-        }
-
-        /* tiles: how many refreshes each picture stood while it moves (like H.264 above) */
-        if (!g_rotMode && g_videoFrames != lastVideoFrames)
-        {
-            static u64 prevTile = 0;
-            u64 now = g_vblankTime ? g_vblankTime : osGetTime();
-            if (prevTile)
-            {
-                u32 v = (u32)((now - prevTile + 8) / 17);
-                if (v >= 1 && v <= 6) g_dispGaps[v > 4 ? 3 : v - 1]++;
-            }
-            prevTile = now;
         }
 
         /* redraw when something changed; both buffers need it (double buffering) */
