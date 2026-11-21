@@ -485,7 +485,10 @@ static u8* g_mvdIn = NULL;                /* linear memory: one NAL unit */
 static u8* g_mvdOut = NULL;               /* linear memory: the decoded picture */
 static MVDSTD_Config g_mvdConfig;
 static volatile bool g_h264Reset = false;   /* server thread -> video thread */
-static volatile u32 g_vidOverruns = 0, g_vidRcvBuf = 0;   /* picture packets dropped: decoder behind */
+static volatile u32 g_vidOverruns = 0, g_vidRcvBuf = 0;
+/* freezes: from a lost frame until the next key frame was shown */
+static volatile u32 g_stallCount = 0, g_stallTotalMs = 0, g_stallMaxMs = 0;
+static u64 g_stallSince = 0;   /* picture packets dropped: decoder behind */
 static volatile u32 g_h264Shown = 0, g_h264Dropped = 0, g_h264Errors = 0, g_h264Repaired = 0;
 
 /* the hardware decoder (New 3DS only); set up once, when the PC asks */
@@ -2026,11 +2029,16 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
     {
         /* H.264 on the 3DS since the last time asked: shown, dropped while waiting for a
            key frame, rebuilt from parity, decoder errors */
-        static u32 last[5];
-        u32 now[5] = { g_h264Shown, g_h264Dropped, g_h264Repaired, g_h264Errors, g_vidOverruns };
-        u32 d[6];
+        static u32 last[7];
+        u32 now[7] = { g_h264Shown, g_h264Dropped, g_h264Repaired, g_h264Errors, g_vidOverruns,
+                       g_stallCount, g_stallTotalMs };
+        u32 d[9];
         for (int i = 0; i < 5; i++) { d[i] = now[i] - last[i]; last[i] = now[i]; }
         d[5] = g_vidRcvBuf;
+        d[6] = now[5] - last[5]; last[5] = now[5];
+        d[7] = now[6] - last[6]; last[6] = now[6];
+        d[8] = g_stallMaxMs;
+        g_stallMaxMs = 0;
         return sendResponse(fd, h, LINK_OK, d, sizeof(d));
     }
 
@@ -2617,7 +2625,13 @@ static void h264Packet(const LinkFramePacket* fp, const u8* data, size_t avail)
         if (d < 0) return;   /* a late packet of an older frame */
         if (d > 0)
         {
-            if (g_h264Open) { g_h264Broken = true; g_h264Dropped++; }   /* never complete */
+            if (g_h264Open)
+            {
+                /* never complete: the picture stands until the next key frame */
+                if (!g_h264Broken) g_stallSince = osGetTime();
+                g_h264Broken = true;
+                g_h264Dropped++;
+            }
             g_h264Open = false;
         }
     }
@@ -2677,8 +2691,23 @@ static void h264Packet(const LinkFramePacket* fp, const u8* data, size_t avail)
         g_h264Open = false;
         if (g_h264Broken && !g_h264Key) { g_h264Dropped++; return; }   /* wait for a key frame */
         bool ok = h264Decode(g_h264Size);
-        if (!ok) g_h264Broken = true;
-        else if (g_h264Key) g_h264Broken = false;
+        if (!ok)
+        {
+            if (!g_h264Broken) g_stallSince = osGetTime();
+            g_h264Broken = true;
+        }
+        else if (g_h264Key)
+        {
+            if (g_h264Broken && g_stallSince)
+            {
+                u32 ms = (u32)(osGetTime() - g_stallSince);
+                g_stallCount++;
+                g_stallTotalMs += ms;
+                if (ms > g_stallMaxMs) g_stallMaxMs = ms;
+            }
+            g_stallSince = 0;
+            g_h264Broken = false;
+        }
     }
 }
 
