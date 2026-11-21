@@ -2503,7 +2503,11 @@ static void presentFrame(void)
     u64 now = osGetTime();
     memcpy(g_rotImage[slot], g_dsBack, sizeof(g_dsBack));
     g_rotMade[slot] = now;
-    g_rotDue[slot] = rotDue(g_tileTs, now);
+    /* the same picture again (refined, refreshed): at once, and it must not count as a
+       delay of the WiFi in rotDue */
+    static u32 lastTs = 0;
+    g_rotDue[slot] = g_tileTs && g_tileTs == lastTs ? now : rotDue(g_tileTs, now);
+    lastTs = g_tileTs;
     g_rotSrc[slot] = g_tileTs;
     __sync_synchronize();
     g_rotWritten = no;
@@ -2554,7 +2558,7 @@ static u32 g_h264Size = 0;
 
 /* When to show a picture the PC made at `ts` (its clock, ms) and that is decoded now. The
    delay from the PC to here varies (WiFi, decoding): each picture waits until the delay that
-   9 of 10 recent pictures had - then they come out as evenly as they were made. */
+   97 of 100 recent pictures had - then they come out as evenly as they were made. */
 static u64 rotDue(u32 ts, u64 now)
 {
     static bool have = false;
@@ -2575,7 +2579,8 @@ static u64 rotDue(u32 ts, u64 now)
         while (j > 0 && tmp[j - 1] > v) { tmp[j] = tmp[j - 1]; j--; }
         tmp[j] = v;
     }
-    s32 lo = tmp[0], hi = tmp[(n * 9) / 10 < n ? (n * 9) / 10 : n - 1];
+    /* 97 of 100 recent pictures were here by then (tiles vary more in size than H.264) */
+    s32 lo = tmp[0], hi = tmp[(n * 97) / 100 < n ? (n * 97) / 100 : n - 1];
     if (hi - lo > 50) hi = lo + 50;   /* never more than 50 ms extra */
     /* the wait itself only moves slowly: else its own wobble makes the pictures uneven */
     static s32 cur;
@@ -2618,7 +2623,9 @@ static bool h264Decode(u32 size)
                         u64 now = osGetTime();
                         memcpy(g_rotImage[slot], g_mvdOut, sizeof(g_rotImage[0]));
                         g_rotMade[slot] = now;
-                        g_rotDue[slot] = rotDue(g_h264Ts, now);
+                        static u32 lastTs = 0;   /* the same picture again: at once */
+                        g_rotDue[slot] = g_h264Ts && g_h264Ts == lastTs ? now : rotDue(g_h264Ts, now);
+                        lastTs = g_h264Ts;
                         g_rotSrc[slot] = g_h264Ts;
                         __sync_synchronize();
                         g_rotWritten = no;
