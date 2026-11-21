@@ -2484,7 +2484,8 @@ static bool haveAll(u32 from, u32 to)
 static u8 g_h264Buf[H264_MAX_PARTS * LINK_H264_PART];
 static u8 g_h264Have[H264_MAX_PARTS];
 static u32 g_h264Frame = 0;
-static bool g_h264Open = false, g_h264Key = false, g_h264Broken = true;
+static bool g_h264Open = false, g_h264Key = false;
+static volatile bool g_h264Broken = true;   /* waits for a key frame (asked for in the input packets) */
 static int g_h264Got = 0, g_h264Total = -1;
 static u32 g_h264Size = 0;
 
@@ -3040,6 +3041,9 @@ static void inputThread(void* arg)
                 p.videoAckMask = g_ackMask;
             }
             LightLock_Unlock(&g_ackLock);
+            /* a frame could not be rebuilt: ask for a key frame right away (a changed flag
+               goes out at once) instead of letting the PC work it out from the receipts */
+            if (g_rotMode && g_h264Broken && g_tcpConnected) p.flags |= LINK_INPUT_NEEDKEY;
 
             /* Only send what is new: a change of the input goes out at once (and
                twice more, in case one gets lost on the WiFi); receipts for the
