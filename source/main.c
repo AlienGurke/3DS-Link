@@ -492,6 +492,7 @@ static volatile u64 g_rotMade[ROT_SLOTS];  /* when it was decoded */
 static volatile u32 g_rotSrc[ROT_SLOTS];   /* the PC's time of it (0 = unknown) */
 static volatile u32 g_h264Glitched = 0;   /* frames decoded although one before got lost */
 static volatile u32 g_loopSlow = 0;
+static volatile u32 g_tileShown = 0, g_tileForced = 0;   /* tiles: pictures shown, by the 250 ms safety net */
 static u64 g_vblankTime = 0;   /* when the last screen refresh began (main loop) */
 /* while it moves: how many screen refreshes each picture stood (1, 2, 3, 4+) */
 static volatile u32 g_dispGaps[4];   /* main loop missed a screen refresh */
@@ -2046,11 +2047,12 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
     {
         /* H.264 on the 3DS since the last time asked: shown, dropped while waiting for a
            key frame, rebuilt from parity, decoder errors */
-        static u32 last[16];
-        u32 now[16] = { g_h264Shown, g_h264Dropped, g_h264Repaired, g_h264Errors, g_vidOverruns,
+        static u32 last[18];
+        u32 now[18] = { g_h264Shown, g_h264Dropped, g_h264Repaired, g_h264Errors, g_vidOverruns,
                         g_stallCount, g_stallTotalMs, g_h264Glitched, g_rotLate, g_rotStutter, g_rotWaitN,
-                        g_loopSlow, g_dispGaps[0], g_dispGaps[1], g_dispGaps[2], g_dispGaps[3] };
-        u32 d[18];
+                        g_loopSlow, g_dispGaps[0], g_dispGaps[1], g_dispGaps[2], g_dispGaps[3],
+                        g_tileShown, g_tileForced };
+        u32 d[20];
         for (int i = 0; i < 5; i++) { d[i] = now[i] - last[i]; last[i] = now[i]; }
         d[5] = g_vidRcvBuf;
         d[6] = now[5] - last[5]; last[5] = now[5];
@@ -2067,7 +2069,7 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
         lastWait = waitSum;
         d[13] = now[11] - last[11];   /* screen refreshes the main loop missed */
         last[11] = now[11];
-        for (int i = 12; i < 16; i++) { d[i + 2] = now[i] - last[i]; last[i] = now[i]; }
+        for (int i = 12; i < 18; i++) { d[i + 2] = now[i] - last[i]; last[i] = now[i]; }
         return sendResponse(fd, h, LINK_OK, d, sizeof(d));
     }
 
@@ -2478,6 +2480,7 @@ void link_test_on_present(const u16* img);   /* only for the PC simulation */
 static void presentFrame(void)
 {
     memcpy(g_dsImage, g_dsBack, sizeof(g_dsImage));
+    g_tileShown++;
     g_videoFrames++;
 #ifdef LINK_HOST_TEST
     link_test_on_present(g_dsImage);
@@ -2874,6 +2877,7 @@ static void videoThread(void* arg)
             /* safety net: never freeze, even if consistency cannot be reached */
             if (frameOpen && osGetTime() - lastPresent > 250)
             {
+                g_tileForced++;
                 presentFrame();
                 frameOpen = false;
                 lastPresent = osGetTime();
@@ -3659,6 +3663,19 @@ int main(int argc, char** argv)
                 shownNo = pickNo;
                 newPicture = true;
             }
+        }
+
+        /* tiles: how many refreshes each picture stood while it moves (like H.264 above) */
+        if (!g_rotMode && g_videoFrames != lastVideoFrames)
+        {
+            static u64 prevTile = 0;
+            u64 now = g_vblankTime ? g_vblankTime : osGetTime();
+            if (prevTile)
+            {
+                u32 v = (u32)((now - prevTile + 8) / 17);
+                if (v >= 1 && v <= 6) g_dispGaps[v > 4 ? 3 : v - 1]++;
+            }
+            prevTile = now;
         }
 
         /* redraw when something changed; both buffers need it (double buffering) */
