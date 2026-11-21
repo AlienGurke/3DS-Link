@@ -3076,7 +3076,7 @@ static void videoThread(void* arg)
 }
 
 /* ------------------------------------------------------------------ */
-/* input thread: samples HID every 4 ms and sends it straight away     */
+/* input thread: samples HID every 1 ms and sends it straight away     */
 
 typedef struct
 {
@@ -3204,7 +3204,7 @@ static void inputThread(void* arg)
 
         /* HELO from the PC (keep-alive, once a second): checking every 50 ms
            is plenty and keeps the socket service free for the transfers */
-        if (!g_bulkActive && ++heloCheck >= 12)
+        if (!g_bulkActive && ++heloCheck >= 48)   /* every ~48 ms (loop: 1 ms) */
         for (heloCheck = 0;;)
         {
             uint32_t msg = 0;
@@ -3263,22 +3263,28 @@ static void inputThread(void* arg)
             /* Only send what is new: a change of the input goes out at once (and
                twice more, in case one gets lost on the WiFi); receipts for the
                picture at most every 12 ms; otherwise a sign of life every 50 ms.
-               Saves most of the 250 packets a second (WiFi time and battery). */
+               Saves most of the 1000 packets a second (WiFi time and battery). */
             u64 now = osGetTime();
             #define NEAR(a, b) ((a) - (b) <= 2 && (b) - (a) <= 2)
             bool inputChanged = p.keys != lastSent.keys || p.status != lastSent.status ||
                 (p.flags & ~LINK_INPUT_VIDEOACK) != (lastSent.flags & ~LINK_INPUT_VIDEOACK) ||
                 p.touchX != lastSent.touchX || p.touchY != lastSent.touchY ||
-                p.dsTouchX != lastSent.dsTouchX || p.dsTouchY != lastSent.dsTouchY ||
-                !NEAR(p.cpadX, lastSent.cpadX) || !NEAR(p.cpadY, lastSent.cpadY) ||
+                p.dsTouchX != lastSent.dsTouchX || p.dsTouchY != lastSent.dsTouchY;
+            /* the sticks move all the time while held: at most every 4 ms (each packet takes
+               WiFi time), buttons and touch at once */
+            bool stickChanged = !NEAR(p.cpadX, lastSent.cpadX) || !NEAR(p.cpadY, lastSent.cpadY) ||
                 !NEAR(p.cstickX, lastSent.cstickX) || !NEAR(p.cstickY, lastSent.cstickY);
+            if (stickChanged && now - lastSendTime >= 4) inputChanged = true;
             #undef NEAR
             bool ackChanged = p.videoAckSeq != lastSent.videoAckSeq || p.videoAckMask != lastSent.videoAckMask ||
                 (p.flags & LINK_INPUT_VIDEOACK) != (lastSent.flags & LINK_INPUT_VIDEOACK);
-            if (inputChanged) repeatSends = 3;
-            if (repeatSends > 0 || (ackChanged && now - lastSendTime >= 12) || now - lastSendTime >= 50)
+            /* a change goes out the same millisecond, then twice more 4 ms apart (in case
+               the WiFi loses one) */
+            bool repeatDue = repeatSends > 0 && now - lastSendTime >= 4;
+            if (inputChanged) repeatSends = 2;
+            if (inputChanged || repeatDue || (ackChanged && now - lastSendTime >= 12) || now - lastSendTime >= 50)
             {
-                if (repeatSends > 0) repeatSends--;
+                if (repeatDue && !inputChanged) repeatSends--;
                 p.id = packetId++;
                 sendto(g_udpFd, &p, sizeof(p), 0, (struct sockaddr*)&peer, sizeof(peer));
                 lastSent = p;
@@ -3292,12 +3298,13 @@ static void inputThread(void* arg)
         g_input.dsTouch = dsTouch;
         g_input.dsX = dsX;
         g_input.dsY = dsY;
-        g_input.quit = quitHold > 250;   /* 250 x 4 ms */
+        g_input.quit = quitHold > 1000;   /* 1000 x 1 ms */
         g_input.haveUdpPeer = havePeer;
         LightLock_Unlock(&g_lock);
 
+        /* every millisecond: a press goes out at most 1 ms after the 3DS saw it */
         u64 el = osGetTime() - start;
-        if (el < 4) svcSleepThread((s64)(4 - el) * 1000000LL);
+        if (el < 1) svcSleepThread(1000000LL);
     }
 }
 
