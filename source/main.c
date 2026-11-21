@@ -484,6 +484,7 @@ static bool g_mvdReady = false;
 static u8* g_mvdIn = NULL;                /* linear memory: one NAL unit */
 static u8* g_mvdOut = NULL;               /* linear memory: the decoded picture */
 static MVDSTD_Config g_mvdConfig;
+static volatile bool g_h264Reset = false;   /* server thread -> video thread */
 static volatile u32 g_h264Shown = 0, g_h264Dropped = 0, g_h264Errors = 0, g_h264Repaired = 0;
 
 /* the hardware decoder (New 3DS only); set up once, when the PC asks */
@@ -1186,6 +1187,7 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
     {
     case LINK_CMD_HELLO:
     {
+        g_h264Reset = true;   /* a new emulator session: its frame numbers start anew */
         LinkHelloResp r;
         memset(&r, 0, sizeof(r));
         r.version = LINK_VERSION;
@@ -2598,9 +2600,18 @@ static void h264Repair(void)
 
 static void h264Packet(const LinkFramePacket* fp, const u8* data, size_t avail)
 {
+    if (g_h264Reset)
+    {
+        g_h264Reset = false;
+        g_h264Frame = 0;
+        g_h264Open = false;
+        g_h264Broken = true;   /* the decoder needs a key frame first */
+    }
     if (g_h264Open || g_h264Frame != 0)
     {
         s32 d = (s32)(fp->frameId - g_h264Frame);
+        /* far back: Azahar was restarted and counts from 1 again */
+        if (d < -1000) { g_h264Frame = 0; g_h264Open = false; g_h264Broken = true; d = 1; }
         if (d < 0) return;   /* a late packet of an older frame */
         if (d > 0)
         {
