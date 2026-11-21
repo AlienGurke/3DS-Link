@@ -2073,6 +2073,17 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
         return sendResponse(fd, h, LINK_OK, d, sizeof(d));
     }
 
+    case LINK_CMD_VIDEOPROBE:
+    {
+        static u8 probe[4 + sizeof(g_rotImage[0])];
+        if (!g_rotMode) return sendResponse(fd, h, LINK_ERR_NOTFOUND, NULL, 0);
+        int idx = g_rotIdx;
+        u32 ts = g_rotSrc[idx];
+        memcpy(probe, &ts, 4);
+        memcpy(probe + 4, g_rotImage[idx], sizeof(g_rotImage[0]));
+        return sendResponse(fd, h, LINK_OK, probe, sizeof(probe));
+    }
+
     case LINK_CMD_VIDEOCAPS:
     {
         linkGfInit();
