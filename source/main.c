@@ -2032,7 +2032,8 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
 
     case LINK_CMD_VIDEOCAPS:
     {
-        u32 caps = mvdSetup() ? LINK_VIDCAP_H264 : 0;
+        linkGfInit();
+        u32 caps = mvdSetup() ? (LINK_VIDCAP_H264 | LINK_VIDCAP_H264_RS) : 0;
         return sendResponse(fd, h, LINK_OK, &caps, sizeof(caps));
     }
 
@@ -2520,37 +2521,78 @@ static bool h264Decode(u32 size)
     return true;
 }
 
-#define H264_MAX_GROUPS 4
+#define H264_MAX_GROUPS LINK_H264_MAX_PARITY
 static u8 g_h264Par[H264_MAX_GROUPS][LINK_H264_PART];
 static bool g_h264ParHave[H264_MAX_GROUPS];
-static int g_h264Groups = 0;          /* from a parity packet (0 = none seen) */
+static int g_h264Groups = 0;          /* parity packets of this frame (0 = none seen) */
 static u32 g_h264LastLen = 0, g_h264SeqBase = 0;
 static bool g_h264SeqKnown = false;
 
-/* one packet missing in a parity group: rebuild it from the parity */
+/* Reed-Solomon: rebuild up to m missing data packets from the parity packets */
 static void h264Repair(void)
 {
-    if (g_h264Groups <= 0 || g_h264Total <= 0) return;
-    for (int g = 0; g < g_h264Groups; g++)
+    int k = g_h264Total, m = g_h264Groups;
+    if (m <= 0 || k <= 0 || k > H264_MAX_PARTS) return;
+    int miss[H264_MAX_GROUPS], rows[H264_MAX_GROUPS], e = 0, r = 0;
+    for (int i = 0; i < k; i++)
+        if (!g_h264Have[i]) { if (e == H264_MAX_GROUPS) return; miss[e++] = i; }
+    for (int j = 0; j < m && r < e; j++)
+        if (g_h264ParHave[j]) rows[r++] = j;
+    if (e == 0 || r < e) return;   /* not enough parity yet */
+
+    /* A[r][c] = coefficient of missing packet c in parity row r; invert it */
+    u8 A[H264_MAX_GROUPS][2 * H264_MAX_GROUPS];
+    for (int i = 0; i < e; i++)
+        for (int c = 0; c < 2 * e; c++)
+            A[i][c] = c < e ? linkCauchy(rows[i], miss[c], m) : (c - e == i);
+    for (int c = 0; c < e; c++)
     {
-        if (!g_h264ParHave[g]) continue;
-        int missing = -1, count = 0;
-        for (int i = g; i < g_h264Total; i += g_h264Groups)
-            if (!g_h264Have[i]) { missing = i; count++; }
-        if (count != 1) continue;
-        u8* dst = g_h264Buf + missing * LINK_H264_PART;
-        memcpy(dst, g_h264Par[g], LINK_H264_PART);
-        for (int i = g; i < g_h264Total; i += g_h264Groups)
+        int p = c;
+        while (p < e && !A[p][c]) p++;
+        if (p == e) return;   /* cannot happen with a Cauchy matrix */
+        if (p != c)
+            for (int x = 0; x < 2 * e; x++) { u8 t = A[p][x]; A[p][x] = A[c][x]; A[c][x] = t; }
+        u8 inv = linkGfInv(A[c][c]);
+        for (int x = 0; x < 2 * e; x++) A[c][x] = linkGfMul(A[c][x], inv);
+        for (int i = 0; i < e; i++)
         {
-            if (i == missing) continue;
-            const u8* src = g_h264Buf + i * LINK_H264_PART;
-            for (int k = 0; k < LINK_H264_PART; k++) dst[k] ^= src[k];
+            if (i == c || !A[i][c]) continue;
+            u8 f = A[i][c];
+            for (int x = 0; x < 2 * e; x++) A[i][x] ^= linkGfMul(f, A[c][x]);
         }
-        g_h264Have[missing] = 1;
+    }
+    /* syndromes: parity minus what the packets that arrived contribute */
+    static u8 syn[H264_MAX_GROUPS][LINK_H264_PART];
+    u8 tab[256];
+    for (int i = 0; i < e; i++)
+    {
+        memcpy(syn[i], g_h264Par[rows[i]], LINK_H264_PART);
+        for (int d = 0; d < k; d++)
+        {
+            if (!g_h264Have[d]) continue;
+            u8 c = linkCauchy(rows[i], d, m);
+            for (int x = 0; x < 256; x++) tab[x] = linkGfMul(c, (u8)x);
+            const u8* src = g_h264Buf + d * LINK_H264_PART;
+            for (int b = 0; b < LINK_H264_PART; b++) syn[i][b] ^= tab[src[b]];
+        }
+    }
+    /* missing packet c = sum over r of inverse[c][r] * syndrome r */
+    for (int c = 0; c < e; c++)
+    {
+        u8* dst = g_h264Buf + miss[c] * LINK_H264_PART;
+        memset(dst, 0, LINK_H264_PART);
+        for (int i = 0; i < e; i++)
+        {
+            u8 f = A[c][e + i];
+            if (!f) continue;
+            for (int x = 0; x < 256; x++) tab[x] = linkGfMul(f, (u8)x);
+            for (int b = 0; b < LINK_H264_PART; b++) dst[b] ^= tab[syn[i][b]];
+        }
+        g_h264Have[miss[c]] = 1;
         g_h264Got++;
         g_h264Repaired++;
-        if (missing == g_h264Total - 1) g_h264Size = (u32)missing * LINK_H264_PART + g_h264LastLen;
-        if (g_h264SeqKnown) noteVideoSeq(g_h264SeqBase + (u32)missing);   /* as if it arrived */
+        if (miss[c] == k - 1) g_h264Size = (u32)miss[c] * LINK_H264_PART + g_h264LastLen;
+        if (g_h264SeqKnown) noteVideoSeq(g_h264SeqBase + (u32)miss[c]);   /* as if it arrived */
     }
 }
 
@@ -2587,7 +2629,7 @@ static void h264Packet(const LinkFramePacket* fp, const u8* data, size_t avail)
         /* a parity packet */
         int parts = (int)((fp->baseSeq >> 8) & 0xFFFF);
         int groups = (int)((fp->baseSeq >> 4) & 0xF);
-        int g = (int)(fp->baseSeq & 0xF);
+        int g = (int)(fp->baseSeq & 0xF);   /* parity row j */
         if (parts <= 0 || parts > H264_MAX_PARTS || groups < 1 || groups > H264_MAX_GROUPS || g >= groups ||
             avail < LINK_H264_PART || len > LINK_H264_PART) return;
         memcpy(g_h264Par[g], data, LINK_H264_PART);
