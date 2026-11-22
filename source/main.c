@@ -104,6 +104,7 @@ enum StrId
     S_M_STATUSBAR, S_BAT, S_WIFI,
     S_TAB_DS, S_TAB_3DS, S_NO_LIB, S_NEED_MELONDS, S_NEED_AZAHAR, S_ON3DS,
     S_M_GLITCH, S_GLITCH_ALLOW, S_GLITCH_NEVER,
+    S_M_PACE, S_PACE_EVEN, S_PACE_FAST,
     S_COUNT
 };
 
@@ -134,6 +135,7 @@ static const char* const g_strs[LANG_COUNT][S_COUNT] = {
         "To start a DS game: connect melonDS", "To start a 3DS game: connect Azahar",
         "3DS = also installed on this 3DS",
         "Picture glitches", "allow (smoother)", "never (pauses briefly)",
+        "Picture timing", "even (recommended)", "fast (may stutter)",
     },
     {   /* Deutsch */
         "melonDS Link", "IP-Adresse:", "verbunden", "wartet...", "Steuerung:", "aktiv", "Bild:",
@@ -162,6 +164,7 @@ static const char* const g_strs[LANG_COUNT][S_COUNT] = {
         "Für DS-Spiele: melonDS verbinden", "Für 3DS-Spiele: Azahar verbinden",
         "3DS = auch auf diesem 3DS installiert",
         "Bildfehler", "erlauben (flüssiger)", "nie (hält kurz an)",
+        "Bild-Takt", "gleichmäßig (empfohlen)", "schnell (kann ruckeln)",
     },
 };
 static char g_tr[S_COUNT][80];   /* current language, already in code page 437 */
@@ -184,6 +187,7 @@ static const char* const g_strKeys[S_COUNT] = {
     "menu_statusbar", "battery", "wifi",
     "tab_ds", "tab_3ds", "no_library", "need_melonds", "need_azahar", "on_3ds",
     "menu_glitch", "glitch_allow", "glitch_never",
+    "menu_pace", "pace_even", "pace_fast",
 };
 /* the files carry a fingerprint of the built-in texts: when an app update
    changes a text, they are written anew (so the change shows up) */
@@ -2602,6 +2606,9 @@ static bool g_h264Clean = false;   /* a key frame was decoded since the decoder 
 /* option: decode on after a lost frame (smoother; where it moved, the picture is slightly
    wrong until the key frame the 3DS asks for at once arrives) */
 static volatile bool g_allowGlitch = true;
+/* option: a smaller wait for late pictures (less delay; a late picture then stands one
+   refresh longer more often) */
+static volatile bool g_fastPic = false;
 static u32 g_h264Ts = 0;           /* the PC's time of the frame being received (0 = none) */
 static int g_h264Got = 0, g_h264Total = -1;
 static u32 g_h264Size = 0;
@@ -2629,9 +2636,12 @@ static u64 rotDue(u32 ts, u64 now)
         while (j > 0 && tmp[j - 1] > v) { tmp[j] = tmp[j - 1]; j--; }
         tmp[j] = v;
     }
-    /* 97 of 100 recent pictures were here by then (tiles vary more in size than H.264) */
-    s32 lo = tmp[0], hi = tmp[(n * 97) / 100 < n ? (n * 97) / 100 : n - 1];
-    if (hi - lo > 50) hi = lo + 50;   /* never more than 50 ms extra */
+    /* 97 of 100 recent pictures were here by then (tiles vary more in size than H.264);
+       fast: 75 of 100, never more than 20 ms extra */
+    const int pct = g_fastPic ? 75 : 97;
+    const s32 cap = g_fastPic ? 20 : 50;
+    s32 lo = tmp[0], hi = tmp[(n * pct) / 100 < n ? (n * pct) / 100 : n - 1];
+    if (hi - lo > cap) hi = lo + cap;
     /* the wait itself only moves slowly: else its own wobble makes the pictures uneven */
     static s32 cur;
     if (n == 1) cur = hi;
@@ -3622,6 +3632,7 @@ static void loadConfig(void)
         else if (sscanf(line, "shotmode=%d", &v) == 1) g_shotMode = v >= 0 && v < LINK_SHOT_MODES ? v : 0;
         else if (sscanf(line, "statusbar=%d", &v) == 1) g_statusBar = v != 0;
         else if (sscanf(line, "glitch=%d", &v) == 1) g_allowGlitch = v != 0;
+        else if (sscanf(line, "fastpic=%d", &v) == 1) g_fastPic = v != 0;
         else if (sscanf(line, "lang=%d", &v) == 1) g_lang = v;
         else if (sscanf(line, "client=%d", &v) == 1) g_client = v == (int)LINK_CLIENT_AZAHAR ? LINK_CLIENT_AZAHAR : LINK_CLIENT_MELONDS;
         else if (strncmp(line, "last=", 5) == 0)
@@ -3648,6 +3659,7 @@ static void saveConfig(void)
     fprintf(f, "shotmode=%d\n", g_shotMode);
     fprintf(f, "statusbar=%d\n", g_statusBar ? 1 : 0);
     fprintf(f, "glitch=%d\n", g_allowGlitch ? 1 : 0);
+    fprintf(f, "fastpic=%d\n", g_fastPic ? 1 : 0);
     fprintf(f, "lang=%d\n", g_lang);
     fprintf(f, "client=%d\n", (int)g_client);
     fprintf(f, "romdir=%s\n", g_romDir);
@@ -4124,7 +4136,7 @@ int main(int argc, char** argv)
         setBottomBacklight(!g_videoOff && !lidDark);
 
         /* the menu: only what makes sense right now */
-        enum { MI_BACK, MI_GAMES, MI_SHOT, MI_SHOTMODE, MI_BACKUPS, MI_DISPLAY, MI_BOTTOM, MI_TOPOFF, MI_STATUSBAR, MI_GLITCH, MI_LANG, MI_STOP, MI_QUIT };
+        enum { MI_BACK, MI_GAMES, MI_SHOT, MI_SHOTMODE, MI_BACKUPS, MI_DISPLAY, MI_BOTTOM, MI_TOPOFF, MI_STATUSBAR, MI_GLITCH, MI_PACE, MI_LANG, MI_STOP, MI_QUIT };
         int items[13], itemCount = 0;
         bool playing = g_gameStarted && !g_launchPending;
         if (g_gameStarted) items[itemCount++] = MI_BACK;
@@ -4148,6 +4160,7 @@ int main(int argc, char** argv)
         items[itemCount++] = MI_TOPOFF;
         items[itemCount++] = MI_STATUSBAR;
         if (g_mvdReady && g_client == LINK_CLIENT_AZAHAR) items[itemCount++] = MI_GLITCH;
+        if (!g_videoOff) items[itemCount++] = MI_PACE;
         items[itemCount++] = MI_LANG;
         if (playing && g_tcpConnected) items[itemCount++] = MI_STOP;
         items[itemCount++] = MI_QUIT;
@@ -4240,6 +4253,10 @@ int main(int argc, char** argv)
                     break;
                 case MI_GLITCH:
                     g_allowGlitch = !g_allowGlitch;
+                    saveConfig();
+                    break;
+                case MI_PACE:
+                    g_fastPic = !g_fastPic;
                     saveConfig();
                     break;
                 case MI_BOTTOM:
@@ -4516,6 +4533,7 @@ int main(int argc, char** argv)
                 case MI_TOPOFF: snprintf(label, sizeof(label), "%s", T(S_M_TOPOFF)); break;
                 case MI_STATUSBAR: snprintf(label, sizeof(label), "%s: %s", T(S_M_STATUSBAR), g_statusBar ? T(S_ON) : T(S_OFF)); break;
                 case MI_GLITCH: snprintf(label, sizeof(label), "%s: %s", T(S_M_GLITCH), g_allowGlitch ? T(S_GLITCH_ALLOW) : T(S_GLITCH_NEVER)); break;
+                case MI_PACE: snprintf(label, sizeof(label), "%s: %s", T(S_M_PACE), g_fastPic ? T(S_PACE_FAST) : T(S_PACE_EVEN)); break;
                 case MI_LANG: snprintf(label, sizeof(label), "%s: %s", T(S_M_LANG), T(S_LANGNAME)); break;
                 case MI_STOP: snprintf(label, sizeof(label), "%s", T(S_M_STOP)); break;
                 case MI_BACKUPS:
