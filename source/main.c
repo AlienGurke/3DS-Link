@@ -2123,7 +2123,7 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
         linkGfInit();
         /* then (newer apps) whether the input packets got the WiFi priority (0 = yes) */
         u32 caps[2] = { (mvdSetup() ? (LINK_VIDCAP_H264 | LINK_VIDCAP_H264_RS) : 0) |
-                            LINK_VIDCAP_TILE_RS | LINK_VIDCAP_TILE_TS | LINK_VIDCAP_ECHO | LINK_VIDCAP_TILE_LZ4,
+                            LINK_VIDCAP_TILE_RS | LINK_VIDCAP_TILE_TS | LINK_VIDCAP_ECHO | LINK_VIDCAP_TILE_LZ4 | LINK_VIDCAP_TILE_LZ4X,
                         (u32)g_tosResult };
         return sendResponse(fd, h, LINK_OK, caps, sizeof(caps));
     }
@@ -2977,7 +2977,7 @@ static void videoRecvThread(void* arg)
                 LinkFramePacket fp;
                 memcpy(&fp, dst, sizeof(fp));
                 g_lastVideoTime = osGetTime();
-                bool tiles = fp.magic == LINK_FRAME_MAGIC || fp.magic == LINK_FRAMEZ_MAGIC;
+                bool tiles = fp.magic == LINK_FRAME_MAGIC || fp.magic == LINK_FRAMEZ_MAGIC || fp.magic == LINK_FRAMEZX_MAGIC;
                 if (tiles)
                 {
                     /* tiles of an older frame than one already here (held up on the way): their
@@ -3090,18 +3090,21 @@ static void tileDataAny(const u8* buf, size_t n)
 {
     LinkFramePacket fp;
     memcpy(&fp, buf, sizeof(fp));
-    if (fp.magic != LINK_FRAMEZ_MAGIC)
+    if (fp.magic != LINK_FRAMEZ_MAGIC && fp.magic != LINK_FRAMEZX_MAGIC)
     {
         tileData(buf, n);
         return;
     }
     static u8 un[sizeof(LinkFramePacket) + 4096];
-    if (n < sizeof(fp) + 2) return;
-    u16 rawLen;
+    /* MDFX: also the packed size (a rebuilt packet is zero-padded, LZ4 needs the exact size) */
+    const bool x = fp.magic == LINK_FRAMEZX_MAGIC;
+    const size_t head = sizeof(fp) + (x ? 4 : 2);
+    if (n < head) return;
+    u16 rawLen, packed = (u16)(n - head);
     memcpy(&rawLen, buf + sizeof(fp), 2);
-    if (rawLen > 4096) return;
-    int got = LZ4_decompress_safe((const char*)buf + sizeof(fp) + 2, (char*)un + sizeof(fp),
-                                  (int)(n - sizeof(fp) - 2), 4096);
+    if (x) memcpy(&packed, buf + sizeof(fp) + 2, 2);
+    if (rawLen > 4096 || head + packed > n) return;
+    int got = LZ4_decompress_safe((const char*)buf + head, (char*)un + sizeof(fp), (int)packed, 4096);
     if (got != (int)rawLen) return;
     fp.magic = LINK_FRAME_MAGIC;
     memcpy(un, &fp, sizeof(fp));
@@ -3120,7 +3123,8 @@ static void tileRepair(u32 seqBase)
         LinkFramePacket fp;
         memcpy(&fp, pk, sizeof(fp));
         /* a sane packet of this frame (else the parity was not for these packets) */
-        if ((fp.magic != LINK_FRAME_MAGIC && fp.magic != LINK_FRAMEZ_MAGIC) || fp.frameId != g_tpFrame ||
+        if ((fp.magic != LINK_FRAME_MAGIC && fp.magic != LINK_FRAMEZ_MAGIC && fp.magic != LINK_FRAMEZX_MAGIC) ||
+            fp.frameId != g_tpFrame ||
             fp.seq != seqBase + (u32)rebuilt[c])
             continue;
         g_tileRebuilt++;
@@ -3184,7 +3188,7 @@ static void videoThread(void* arg)
             tileRepair(fp.seq);
             continue;
         }
-        if (fp.magic != LINK_FRAME_MAGIC && fp.magic != LINK_FRAMEZ_MAGIC) continue;
+        if (fp.magic != LINK_FRAME_MAGIC && fp.magic != LINK_FRAMEZ_MAGIC && fp.magic != LINK_FRAMEZX_MAGIC) continue;
         g_rotMode = false;   /* tiles again */
 
         /* keep it for a repair of the frame */
