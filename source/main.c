@@ -3950,7 +3950,9 @@ int main(int argc, char** argv)
                     {
                         s32 held = (s32)(now - g_rotDue[pick]);
                         if (held < heldMin) heldMin = held;
-                        if (++heldN >= 30)
+                        /* (over 4 s, not 1: each move shows one picture a refresh early - a
+                           tiny hitch of its own, so only when the wait clearly persists) */
+                        if (++heldN >= 120)
                         {
                             advance = heldMin > 14;
                             heldMin = 0x7FFFFFFF;
