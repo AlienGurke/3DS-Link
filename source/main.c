@@ -494,6 +494,7 @@ static volatile u32 g_h264Glitched = 0;   /* frames decoded although one before 
 static volatile u32 g_loopSlow = 0;
 static volatile int g_tosResult = -1;   /* input packets' WiFi priority: 0 = set, else the error; -1 = not tried */
 static volatile u32 g_tileRebuilt = 0;
+static volatile u32 g_tileStale = 0;   /* tile packets of an older frame, dropped */
 /* input round trip (3DS -> PC -> 3DS): when each input packet went out, and the results */
 static volatile u64 g_inSentTick[256];
 static volatile u32 g_rttCount = 0, g_rttSumUs = 0, g_rttMaxUs = 0;
@@ -2063,13 +2064,13 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
     {
         /* H.264 on the 3DS since the last time asked: shown, dropped while waiting for a
            key frame, rebuilt from parity, decoder errors */
-        static u32 last[23];
-        u32 now[23] = { g_h264Shown, g_h264Dropped, g_h264Repaired, g_h264Errors, g_vidOverruns,
+        static u32 last[25];
+        u32 now[25] = { g_h264Shown, g_h264Dropped, g_h264Repaired, g_h264Errors, g_vidOverruns,
                         g_stallCount, g_stallTotalMs, g_h264Glitched, g_rotLate, g_rotStutter, g_rotWaitN,
                         g_loopSlow, g_dispGaps[0], g_dispGaps[1], g_dispGaps[2], g_dispGaps[3],
                         g_tileShown, g_tileForced, g_tileRebuilt, g_rttCount, g_rttSumUs,
-                        g_lagCount, g_lagSum };
-        u32 d[27];
+                        g_lagCount, g_lagSum, g_tileStale, g_vidOverruns };
+        u32 d[29];
         for (int i = 0; i < 5; i++) { d[i] = now[i] - last[i]; last[i] = now[i]; }
         d[5] = g_vidRcvBuf;
         d[6] = now[5] - last[5]; last[5] = now[5];
@@ -2101,6 +2102,8 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
         last[22] = now[22];
         d[26] = g_lagMax;
         g_lagMax = 0;
+        /* tile packets dropped as outdated, packets dropped because the decoder was behind */
+        for (int i = 23; i < 25; i++) { d[i + 4] = now[i] - last[i]; last[i] = now[i]; }
         return sendResponse(fd, h, LINK_OK, d, sizeof(d));
     }
 
@@ -2968,12 +2971,30 @@ static void videoRecvThread(void* arg)
             }
             if ((size_t)n >= sizeof(LinkFramePacket))
             {
-                /* receipts at once, not only after decoding */
+                /* receipts at once, not only after decoding - but only for packets that will
+                   be used: one dropped here and confirmed anyway would stay wrong on the
+                   screen (the PC thinks the 3DS has it) */
                 LinkFramePacket fp;
                 memcpy(&fp, dst, sizeof(fp));
-                if (fp.magic == LINK_H264_MAGIC || fp.magic == LINK_FRAME_MAGIC || fp.magic == LINK_FRAMEZ_MAGIC)
-                    noteVideoSeq(fp.seq);
                 g_lastVideoTime = osGetTime();
+                bool tiles = fp.magic == LINK_FRAME_MAGIC || fp.magic == LINK_FRAMEZ_MAGIC;
+                if (tiles)
+                {
+                    /* tiles of an older frame than one already here (held up on the way): their
+                       content is outdated - drawing them would bring back bits of an earlier
+                       picture. Not confirmed, so the PC sends what is current there again. */
+                    static u32 newest = 0;
+                    static bool haveNewest = false;
+                    if (haveNewest && (s32)(fp.frameId - newest) < 0 && (s32)(fp.frameId - newest) > -50)   /* (far back: Azahar started over) */
+                    {
+                        g_tileStale++;
+                        continue;
+                    }
+                    newest = fp.frameId;
+                    haveNewest = true;
+                }
+                if (full) { g_vidOverruns++; continue; }   /* the decoder is far behind */
+                if (fp.magic == LINK_H264_MAGIC || tiles) noteVideoSeq(fp.seq);
             }
             if (full) { g_vidOverruns++; continue; }   /* the decoder is far behind */
             g_vringLen[head] = (u16)n;
