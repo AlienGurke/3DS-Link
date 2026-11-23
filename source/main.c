@@ -4154,7 +4154,11 @@ int main(int argc, char** argv)
             }
         }
         else if (g_tab == 0 && menuCursor >= 0 && menuCursor < g_gameCount) bakGame = menuCursor;
+        /* Azahar: the game selected in the 3DS tab, while none runs (its save is in use then) */
+        int bakLib = -1;
+        if (native && !g_gameStarted && g_tab == 1 && menuCursor >= 0 && menuCursor < g_libCount) bakLib = menuCursor;
         if (bakGame >= 0 && g_tcpConnected && !g_launchPending && !native) items[itemCount++] = MI_BACKUPS;
+        else if (bakLib >= 0 && g_tcpConnected && !g_launchPending) items[itemCount++] = MI_BACKUPS;
         if (!native) items[itemCount++] = MI_DISPLAY;
         items[itemCount++] = MI_BOTTOM;
         items[itemCount++] = MI_TOPOFF;
@@ -4284,7 +4288,8 @@ int main(int argc, char** argv)
                 case MI_STOP: g_localAsk = LA_STOP; break;
                 case MI_BACKUPS:
                     LightLock_Lock(&g_lock);
-                    snprintf(g_bakRom, sizeof(g_bakRom), "%.100s/%.150s", g_romDir, g_games[bakGame]);
+                    if (bakLib >= 0) snprintf(g_bakRom, sizeof(g_bakRom), "%s", g_lib[bakLib].path);
+                    else snprintf(g_bakRom, sizeof(g_bakRom), "%.100s/%.150s", g_romDir, g_games[bakGame]);
                     g_bakCount = 0;
                     g_bakCursor = 0;
                     g_bakWaiting = true;
@@ -4539,8 +4544,12 @@ int main(int argc, char** argv)
                 case MI_BACKUPS:
                 {
                     char nm[300];
-                    utf8ToCp437(nm, sizeof(nm), bakGame >= 0 ? g_games[bakGame] : "");
-                    if (strlen(nm) > 4) nm[strlen(nm) - 4] = 0;
+                    if (bakLib >= 0) utf8ToCp437(nm, sizeof(nm), g_lib[bakLib].name);
+                    else
+                    {
+                        utf8ToCp437(nm, sizeof(nm), bakGame >= 0 ? g_games[bakGame] : "");
+                        if (strlen(nm) > 4) nm[strlen(nm) - 4] = 0;
+                    }
                     snprintf(label, sizeof(label), "%s: %.26s", T(S_M_BACKUPS), nm);
                     break;
                 }
