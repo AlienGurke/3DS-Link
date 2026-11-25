@@ -531,6 +531,7 @@ static u32 g_vblankTickMs = 0; /* the same, in tickMs() */
 /* while it moves: how many screen refreshes each picture stood (1, 2, 3, 4+) */
 static volatile u32 g_dispGaps[4];
 static volatile u32 g_rotLate = 0, g_rotStutter = 0, g_rotWaitSum = 0, g_rotWaitN = 0;
+static volatile u32 g_rotRebase = 0;   /* the timing started over (time stamps jumped) */
 static volatile bool g_rotMode = false;   /* the picture comes as H.264 */
 static bool g_mvdReady = false;
 static u8* g_mvdIn = NULL;                /* linear memory: one NAL unit */
@@ -2780,6 +2781,22 @@ static u64 rotDue(u32 ts, u64 now)
     if (n == 1) cur = hi;
     else if (hi > cur) cur += hi - cur > 2 ? 2 : hi - cur;
     else if (hi < cur) cur -= 1;
+    /* A picture far "earlier" than all before it: the emulator's time jumped ahead of the
+       clock (fast forward, catching up after a slowdown) - not the WiFi. Waiting for it held
+       pictures back by up to a second, and the wait only shrank 1 ms per picture (the log:
+       "waited 250 ms" at 10 pictures a second). Start the timing over from this one. */
+    if (cur - rel > cap + 10)
+    {
+        base = d;
+        n = 0;
+        pos = 0;
+        win[pos] = 0;
+        pos = 1;
+        n = 1;
+        cur = 0;
+        g_rotRebase++;
+        return now;
+    }
     return cur > rel ? now + (u64)(cur - rel) : now;
 }
 
