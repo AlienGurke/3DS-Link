@@ -77,7 +77,7 @@ static void utf8ToCp437(char* out, size_t outSize, const char* in)
 enum { LANG_EN, LANG_DE, LANG_COUNT };
 static int g_lang = LANG_EN;
 static const char* const g_langCodes[LANG_COUNT] = { "en", "de" };
-static volatile bool g_haveLangEvent = false;   /* tell melonDS about a new language */
+static volatile u8 g_haveLangEvent = 0;   /* tell the emulators about a new language (bits: CI) */
 
 /* the emulator on the PC (LINK_CLIENT_*, from its HELLO; remembered in the
    settings). Azahar runs 3DS games: their bottom screen is shown 1:1, the
@@ -85,6 +85,16 @@ static volatile bool g_haveLangEvent = false;   /* tell melonDS about a new lang
 static volatile u32 g_client = LINK_CLIENT_MELONDS;
 static volatile bool g_clientChanged = false;   /* server thread -> main loop */
 #define NATIVE() (g_client == LINK_CLIENT_AZAHAR)
+
+/* Both emulators may be connected at once. One is the active one (g_client): it gets the
+   buttons and sends the picture; the other only gets status packets (LINK_INPUT_IDLE).
+   Index (CI): 0 melonDS, 1 Azahar - the same as the tabs of the game list. Events for an
+   emulator are bit masks of these (1 << CI). */
+#define CI(c) ((c) == LINK_CLIENT_AZAHAR ? 1 : 0)
+#define CLIENT_OF(i) ((i) == 1 ? LINK_CLIENT_AZAHAR : LINK_CLIENT_MELONDS)
+#define ACTIVE_BIT ((u8)(1u << CI(g_client)))
+static volatile bool g_connected[2] = { false, false };
+static volatile u16 g_activeUdpPort = 0;   /* UDP port the active emulator sends from (net order) */
 static const char* emulatorName(void) { return NATIVE() ? "Azahar" : "melonDS"; }
 
 enum StrId
@@ -308,9 +318,10 @@ static char g_askLines[ASK_LINES][52];
 static int g_askLineCount = 0;
 static char g_askA[48], g_askB[48];
 /* events for melonDS besides the launch (guarded by g_lock) */
-static bool g_haveAnswer = false;
+static u8 g_haveAnswer = 0;            /* bit of the emulator that asked */
+static int g_askClient = 0;            /* CI of the emulator that asked */
 static u32 g_answerId = 0, g_answerChoice = 0;
-static bool g_haveShot = false;
+static u8 g_haveShot = 0;
 
 /* ------------------------------------------------------------------ */
 /* socket helpers                                                      */
@@ -454,8 +465,11 @@ static volatile bool g_launchPending = false;    /* picked a game, melonDS has n
 static volatile bool g_sessionNew = false;       /* melonDS runs a game we did not know about */
 static volatile bool g_sessionSame = false;      /* melonDS confirmed the game we play */
 static volatile bool g_sessionEnded = false;     /* melonDS runs no game any more */
+/* the game state of the emulator that is not active (g_lock) */
+typedef struct { bool started, pending; char game[128]; } SavedGame;
+static SavedGame g_saved[2];
 static volatile bool g_videoOff = false;         /* bottom screen picture off (setting) */
-static volatile bool g_haveStopEv = false, g_haveResumeEv = false, g_haveVideoEv = false;
+static volatile u8 g_haveStopEv = 0, g_haveResumeEv = 0, g_haveVideoEv = 0;
 static volatile bool g_saveWriting = false;      /* a save is between WRITE and REPLACE */
 static volatile u64 g_saveWriteTime = 0;
 static volatile bool g_confirmPress = false;     /* L + R + A pressed (input -> main) */
@@ -475,7 +489,8 @@ static char g_bakRom[LINK_MAX_PATH];             /* ROM path the list is for */
 static char g_bakLines[BAK_MAX][48];
 static int g_bakCount = 0, g_bakCursor = 0, g_restoreIdx = 0;
 static u32 g_bakToken = 0;
-static bool g_haveBakReqEv = false, g_haveRestoreEv = false;
+static u8 g_haveBakReqEv = 0, g_haveRestoreEv = 0;
+static int g_bakClient = 0;            /* CI of the emulator whose backups are shown */
 
 /* pending launch for melonDS (guarded by g_lock) */
 /* the picture: DS 256x192 (melonDS) or 3DS 320x240 (Azahar), RGB565, row-major */
@@ -562,7 +577,29 @@ static void setVideoGeometry(u32 client)
 }
 static volatile u64 g_lastVideoTime = 0;
 
-static bool g_haveEvent = false;
+/* another emulator becomes the active one: its game state, its picture size (g_lock not held) */
+static void switchActive(u32 client)
+{
+    if (client == g_client) return;
+    LightLock_Lock(&g_lock);
+    int o = CI(g_client), n = CI(client);
+    g_saved[o].started = g_gameStarted;
+    g_saved[o].pending = g_launchPending;
+    snprintf(g_saved[o].game, sizeof(g_saved[o].game), "%s", g_currentGame);
+    g_gameStarted = g_saved[n].started;
+    g_launchPending = g_saved[n].pending;
+    snprintf(g_currentGame, sizeof(g_currentGame), "%s", g_saved[n].game);
+    g_statusText[0] = 0;
+    g_client = client;
+    g_tcpConnected = g_connected[n];
+    LightLock_Unlock(&g_lock);
+    setVideoGeometry(client);
+    g_h264Reset = true;
+    g_lastVideoTime = 0;
+    g_clientChanged = true;
+}
+
+static u8 g_haveEvent = 0;             /* a game to start: bit of the emulator */
 static LinkEvent g_event;
 static char g_eventRom[LINK_MAX_PATH];
 static char g_eventSave[LINK_MAX_PATH];
@@ -590,7 +627,7 @@ static char* g_libBuf = NULL;        /* the text g_lib points into (main thread)
 static LibGame g_lib[MAX_LIB];
 static int g_libCount = 0;
 static int g_tab = 0;                /* game list tab: 0 DS (melonDS), 1 3DS (Azahar) */
-static bool g_haveLibReqEv = false;  /* Y on the 3DS tab: Azahar sends its list anew */
+static u8 g_haveLibReqEv = 0;  /* Y on the 3DS tab: Azahar sends its list anew */
 
 static bool isOnPcLocked(const char* name)
 {
@@ -718,6 +755,7 @@ static void requestLaunch(int idx)
     struct stat st;
     u64 size = (stat(full, &st) == 0) ? (u64)st.st_size : 0;
 
+    if (g_connected[0]) switchActive(LINK_CLIENT_MELONDS);   /* DS games run in melonDS */
     LightLock_Lock(&g_lock);
     memset(&g_event, 0, sizeof(g_event));
     g_event.type = LINK_EVENT_LAUNCH;
@@ -726,7 +764,7 @@ static void requestLaunch(int idx)
     snprintf(g_eventSave, sizeof(g_eventSave), "%s", save);
     g_event.romPathLen = (uint16_t)strlen(g_eventRom);
     g_event.savePathLen = (uint16_t)strlen(g_eventSave);
-    g_haveEvent = true;
+    g_haveEvent = 1u << 0;
     snprintf(g_currentGame, sizeof(g_currentGame), "%.120s", base);
     snprintf(g_lastGame, sizeof(g_lastGame), "%s", name);
     snprintf(g_statusText, sizeof(g_statusText), "%s", T(S_STARTING));
@@ -815,6 +853,7 @@ static void requestLaunchLib(int idx)
 {
     if (idx < 0 || idx >= g_libCount) return;
     const LibGame* g = &g_lib[idx];
+    if (g_connected[1]) switchActive(LINK_CLIENT_AZAHAR);   /* 3DS games run in Azahar */
     LightLock_Lock(&g_lock);
     memset(&g_event, 0, sizeof(g_event));
     g_event.type = LINK_EVENT_LAUNCH;
@@ -823,7 +862,7 @@ static void requestLaunchLib(int idx)
     g_eventSave[0] = 0;
     g_event.romPathLen = (uint16_t)strlen(g_eventRom);
     g_event.savePathLen = 0;
-    g_haveEvent = true;
+    g_haveEvent = 1u << 1;
     snprintf(g_currentGame, sizeof(g_currentGame), "%.120s", g->name);
     snprintf(g_statusText, sizeof(g_statusText), "%s", T(S_STARTING));
     LightLock_Unlock(&g_lock);
@@ -1192,6 +1231,9 @@ static Handle g_romfsFile;
 static bool g_romfsOpen = false;
 static u64 g_romfsTid = 0;
 
+static int g_cmdSlot = 0;    /* the server slot whose command runs (under g_cmdLock) */
+static int g_arcUser = -1;   /* the slot that opened the save archive */
+
 static void closeLinkArchive(void)
 {
     if (g_arcOpen) FSUSER_CloseArchive(g_arcHandle);
@@ -1217,12 +1259,14 @@ static bool openLinkArchive(const LinkArchiveReq* req, FS_Archive* arch)
                                          (FS_Path){ PATH_BINARY, sizeof(lowpath), lowpath });
     if (R_FAILED(g_arcResult)) return false;
     g_arcOpen = true;
+    g_arcUser = g_cmdSlot;
     g_arcHandle = *arch;
     g_arcKey = *req;
     return true;
 }
 
-static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
+/* ci: which emulator this connection is (CI), -1 until its HELLO */
+static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload, int* ci)
 {
     char path[LINK_MAX_PATH + 8];
 
@@ -1230,7 +1274,6 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
     {
     case LINK_CMD_HELLO:
     {
-        g_h264Reset = true;   /* a new emulator session: its frame numbers start anew */
         LinkHelloResp r;
         memset(&r, 0, sizeof(r));
         r.version = LINK_VERSION;
@@ -1246,18 +1289,20 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
         {
             uint32_t client = (h->len >= 8) ? ((uint32_t*)payload)[1] : LINK_CLIENT_MELONDS;
             if (client != LINK_CLIENT_AZAHAR) client = LINK_CLIENT_MELONDS;
-            setVideoGeometry(client);
-            if (client != g_client)
+            *ci = CI(client);
+            g_connected[*ci] = true;
+            /* it becomes the active one if that one is not connected (or it is it anyway),
+               or if a game picked for it waits */
+            if (client == g_client || !g_connected[CI(g_client)] || (g_haveEvent & (1u << *ci)))
             {
-                /* another emulator: the game of the old one does not run there */
-                LightLock_Lock(&g_lock);
-                g_gameStarted = false;
-                g_launchPending = false;
-                g_currentGame[0] = 0;
-                LightLock_Unlock(&g_lock);
-                g_client = client;
-                g_lastVideoTime = 0;
-                g_clientChanged = true;
+                if (client == g_client)
+                {
+                    g_h264Reset = true;   /* a new emulator session: its frame numbers start anew */
+                    setVideoGeometry(client);
+                    g_lastVideoTime = 0;
+                    g_tcpConnected = true;
+                }
+                else switchActive(client);
             }
         }
         return sendResponse(fd, h, ver == LINK_VERSION ? LINK_OK : LINK_ERR_VERSION, &r, sizeof(r));
@@ -1272,7 +1317,7 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
         size_t n = h->len < sizeof(txt) - 1 ? h->len : sizeof(txt) - 1;
         memcpy(txt, payload, n);
         txt[n] = '\0';
-        setStatusText(txt);
+        if (*ci == CI(g_client)) setStatusText(txt);   /* the line belongs to the active one */
         return sendResponse(fd, h, LINK_OK, NULL, 0);
     }
 
@@ -1404,52 +1449,57 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
 
     case LINK_CMD_POLLEVENT:
     {
+        /* runs without the command lock (see serverThread): its own buffer */
+        static u8 evbuf[2][sizeof(LinkEvent) + 2 * LINK_MAX_PATH];
+        if (*ci < 0) return sendResponse(fd, h, LINK_ERR_NOTFOUND, NULL, 0);
+        u8* out = evbuf[*ci];
+        const u8 me = (u8)(1u << *ci);
         LightLock_Lock(&g_lock);
-        bool have = g_haveEvent;
+        bool have = (g_haveEvent & me) != 0;
         uint32_t used = 0;
         if (have)
         {
-            memcpy(g_outbuf, &g_event, sizeof(g_event));
+            memcpy(out, &g_event, sizeof(g_event));
             used = sizeof(g_event);
-            memcpy(g_outbuf + used, g_eventRom, g_event.romPathLen);
+            memcpy(out + used, g_eventRom, g_event.romPathLen);
             used += g_event.romPathLen;
-            memcpy(g_outbuf + used, g_eventSave, g_event.savePathLen);
+            memcpy(out + used, g_eventSave, g_event.savePathLen);
             used += g_event.savePathLen;
-            g_haveEvent = false;
+            g_haveEvent = 0;
         }
-        else if (g_haveAnswer || g_haveShot || g_haveLangEvent || g_haveStopEv || g_haveResumeEv || g_haveVideoEv ||
-                 g_haveBakReqEv || g_haveRestoreEv || g_haveLibReqEv)
+        else if ((g_haveAnswer | g_haveShot | g_haveLangEvent | g_haveStopEv | g_haveResumeEv | g_haveVideoEv |
+                  g_haveBakReqEv | g_haveRestoreEv | g_haveLibReqEv) & me)
         {
             LinkEvent ev;
             memset(&ev, 0, sizeof(ev));
             const char* text = NULL;
-            if (g_haveAnswer)
+            if (g_haveAnswer & me)
             {
                 ev.type = LINK_EVENT_ANSWER;
                 ev.romSize = g_answerId;
                 ev.reserved = g_answerChoice;
-                g_haveAnswer = false;
+                g_haveAnswer &= ~me;
             }
-            else if (g_haveStopEv) { ev.type = LINK_EVENT_STOPGAME; g_haveStopEv = false; }
-            else if (g_haveShot) { ev.type = LINK_EVENT_SCREENSHOT; ev.reserved = (u32)g_shotMode; g_haveShot = false; }
-            else if (g_haveVideoEv)
+            else if (g_haveStopEv & me) { ev.type = LINK_EVENT_STOPGAME; g_haveStopEv &= ~me; }
+            else if (g_haveShot & me) { ev.type = LINK_EVENT_SCREENSHOT; ev.reserved = (u32)g_shotMode; g_haveShot &= ~me; }
+            else if (g_haveVideoEv & me)
             {
                 ev.type = LINK_EVENT_VIDEO;
                 ev.reserved = g_videoOff ? 0 : 1;
-                g_haveVideoEv = false;
+                g_haveVideoEv &= ~me;
             }
-            else if (g_haveResumeEv) { ev.type = LINK_EVENT_RESUME; g_haveResumeEv = false; }
-            else if (g_haveLibReqEv) { ev.type = LINK_EVENT_LIBRARY; g_haveLibReqEv = false; }
-            else if (g_haveBakReqEv || g_haveRestoreEv)
+            else if (g_haveResumeEv & me) { ev.type = LINK_EVENT_RESUME; g_haveResumeEv &= ~me; }
+            else if (g_haveLibReqEv & me) { ev.type = LINK_EVENT_LIBRARY; g_haveLibReqEv &= ~me; }
+            else if ((g_haveBakReqEv | g_haveRestoreEv) & me)
             {
-                if (g_haveRestoreEv)
+                if (g_haveRestoreEv & me)
                 {
                     ev.type = LINK_EVENT_RESTORE;
                     ev.reserved = (u32)g_restoreIdx;
                     ev.romSize = g_bakToken;
-                    g_haveRestoreEv = false;
+                    g_haveRestoreEv &= ~me;
                 }
-                else { ev.type = LINK_EVENT_BACKUPS; g_haveBakReqEv = false; }
+                else { ev.type = LINK_EVENT_BACKUPS; g_haveBakReqEv &= ~me; }
                 text = g_bakRom;
                 ev.romPathLen = (uint16_t)strlen(text);
             }
@@ -1458,20 +1508,20 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
                 ev.type = LINK_EVENT_LANGUAGE;
                 text = g_langCodes[g_lang];
                 ev.romPathLen = (uint16_t)strlen(text);
-                g_haveLangEvent = false;
+                g_haveLangEvent &= ~me;
             }
-            memcpy(g_outbuf, &ev, sizeof(ev));
+            memcpy(out, &ev, sizeof(ev));
             used = sizeof(ev);
             if (text)
             {
-                memcpy(g_outbuf + used, text, ev.romPathLen);
+                memcpy(out + used, text, ev.romPathLen);
                 used += ev.romPathLen;
             }
             have = true;
         }
         LightLock_Unlock(&g_lock);
         if (!have) return sendResponse(fd, h, LINK_ERR_NOTFOUND, NULL, 0);
-        return sendResponse(fd, h, LINK_OK, g_outbuf, used);
+        return sendResponse(fd, h, LINK_OK, out, used);
     }
 
     case LINK_CMD_ASK:
@@ -1522,6 +1572,7 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
         utf8ToCp437(g_askA, sizeof(g_askA), lines[count - 2]);
         utf8ToCp437(g_askB, sizeof(g_askB), lines[count - 1]);
         g_askId = id;
+        g_askClient = *ci < 0 ? CI(g_client) : *ci;
         g_askActive = true;
         LightLock_Unlock(&g_lock);
         return sendResponse(fd, h, LINK_OK, NULL, 0);
@@ -1575,6 +1626,24 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
         size_t n = h->len - 1 < sizeof(name) - 1 ? h->len - 1 : sizeof(name) - 1;
         memcpy(name, payload + 1, n);
         name[n] = 0;
+        if (*ci >= 0 && *ci != CI(g_client))
+        {
+            /* the other emulator: a game started there while the active one runs none (or is
+               not connected) - it becomes the active one; otherwise only noted */
+            bool take = name[0] && (!g_gameStarted || !g_tcpConnected);
+            if (!take)
+            {
+                LightLock_Lock(&g_lock);
+                SavedGame* sg = &g_saved[*ci];
+                if (flags & LINK_SESSION_LAUNCH_DONE) sg->pending = false;
+                sg->started = name[0] != 0;
+                if (name[0]) sg->pending = false;
+                snprintf(sg->game, sizeof(sg->game), "%s", name);
+                LightLock_Unlock(&g_lock);
+                return sendResponse(fd, h, LINK_OK, NULL, 0);
+            }
+            switchActive(CLIENT_OF(*ci));
+        }
         LightLock_Lock(&g_lock);
         if (flags & LINK_SESSION_LAUNCH_DONE) g_launchPending = false;
         if (name[0])
@@ -2066,6 +2135,8 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload)
 
     case LINK_CMD_VIDEOSTATS:
     {
+        /* the statistics belong to the picture of the active emulator */
+        if (*ci != CI(g_client)) return sendResponse(fd, h, LINK_ERR_NOTFOUND, NULL, 0);
         /* H.264 on the 3DS since the last time asked: shown, dropped while waiting for a
            key frame, rebuilt from parity, decoder errors */
         static u32 last[25];
@@ -2362,9 +2433,29 @@ static int openUdpSocket(u16 port, int rcvbuf)
     return fd;
 }
 
+/* Both emulators can be connected at once (melonDS and Azahar), plus one more slot for an
+   emulator that reconnects while its old connection is not noticed as dead yet (the new
+   one then replaces it). Commands run one at a time (g_cmdLock: shared buffers, the SD
+   card, the save archive), except the quick ones that only touch g_lock-guarded state -
+   so asking for events never waits behind the other emulator's long transfer. */
+#define SERVER_SLOTS 3
+static LightLock g_cmdLock;
+static LightLock g_acceptLock;
+static volatile int g_slotFd[SERVER_SLOTS] = { -1, -1, -1 };
+static volatile int g_slotCi[SERVER_SLOTS] = { -1, -1, -1 };
+
+static bool quickCommand(u16 cmd)
+{
+    return cmd == LINK_CMD_POLLEVENT || cmd == LINK_CMD_PING || cmd == LINK_CMD_HELLO ||
+           cmd == LINK_CMD_STATUSTEXT || cmd == LINK_CMD_SESSION || cmd == LINK_CMD_LIBRARY ||
+           cmd == LINK_CMD_OPTIONS;
+}
+
 static void serverThread(void* arg)
 {
-    (void)arg;
+    const int slot = (int)(intptr_t)arg;
+    u8* payload = slot == 0 ? g_payload : (u8*)malloc(LINK_MAX_PAYLOAD + LINK_MAX_PATH + 64);
+    if (!payload) return;
     u32 gen = g_sockGen;
     while (g_running)
     {
@@ -2372,12 +2463,19 @@ static void serverThread(void* arg)
         if (gen != g_sockGen)
         {
             gen = g_sockGen;
-            if (g_listenFd >= 0) close(g_listenFd);
-            g_listenFd = openListenSocket();
+            if (slot == 0)   /* one of them opens the listening socket anew */
+            {
+                LightLock_Lock(&g_acceptLock);
+                if (g_listenFd >= 0) close(g_listenFd);
+                g_listenFd = openListenSocket();
+                LightLock_Unlock(&g_acceptLock);
+            }
         }
         struct sockaddr_in peer;
         socklen_t plen = sizeof(peer);
-        int fd = accept(g_listenFd, (struct sockaddr*)&peer, &plen);
+        LightLock_Lock(&g_acceptLock);
+        int fd = g_listenFd >= 0 ? accept(g_listenFd, (struct sockaddr*)&peer, &plen) : -1;
+        LightLock_Unlock(&g_acceptLock);
         if (fd < 0)
         {
             svcSleepThread(50 * 1000000LL);
@@ -2397,7 +2495,8 @@ static void serverThread(void* arg)
         LightLock_Lock(&g_lock);
         snprintf(g_peerName, sizeof(g_peerName), "%s", inet_ntoa(peer.sin_addr));
         LightLock_Unlock(&g_lock);
-        g_tcpConnected = true;
+        g_slotFd[slot] = fd;
+        int ci = -1;
 
         while (g_running && gen == g_sockGen && !g_netPause)
         {
@@ -2405,19 +2504,53 @@ static void serverThread(void* arg)
             if (!recvAll(fd, &h, sizeof(h))) break;
             if (h.magic != LINK_MAGIC || h.len > LINK_MAX_PAYLOAD + LINK_MAX_PATH + 64) break;
             u64 r0 = svcGetSystemTick();
-            if (h.len && !recvAll(fd, g_payload, h.len)) break;
+            if (h.len && !recvAll(fd, payload, h.len)) break;
             if (h.cmd == LINK_CMD_WRITE)
             {
                 g_upBytes += h.len;
                 g_upRecvTicks += svcGetSystemTick() - r0;
             }
-            if (!handleCommand(fd, &h, g_payload)) break;
+            bool ok;
+            if (quickCommand(h.cmd)) ok = handleCommand(fd, &h, payload, &ci);
+            else
+            {
+                LightLock_Lock(&g_cmdLock);
+                g_cmdSlot = slot;
+                ok = handleCommand(fd, &h, payload, &ci);
+                LightLock_Unlock(&g_cmdLock);
+            }
+            if (!ok) break;
+            if (h.cmd == LINK_CMD_HELLO && ci >= 0 && g_slotCi[slot] != ci)
+            {
+                g_slotCi[slot] = ci;
+                /* the same emulator on another connection: that one is dead (it reconnected) */
+                for (int o = 0; o < SERVER_SLOTS; o++)
+                    if (o != slot && g_slotCi[o] == ci && g_slotFd[o] >= 0) shutdown(g_slotFd[o], SHUT_RDWR);
+            }
         }
 
-        closeLinkArchive();   /* the emulator is gone: let go of the save */
+        LightLock_Lock(&g_cmdLock);
+        if (g_arcUser == slot) closeLinkArchive();   /* the emulator is gone: let go of the save */
+        LightLock_Unlock(&g_cmdLock);
         close(fd);
-        g_tcpConnected = false;
-        setStatusText("");
+        g_slotFd[slot] = -1;
+        g_slotCi[slot] = -1;
+        if (ci >= 0)
+        {
+            bool still = false;   /* (it reconnected on another slot already) */
+            for (int o = 0; o < SERVER_SLOTS; o++) still |= g_slotCi[o] == ci;
+            if (!still)
+            {
+                g_connected[ci] = false;
+                if (ci == CI(g_client))
+                {
+                    g_tcpConnected = false;
+                    setStatusText("");
+                    /* the other one is there: it becomes the active one */
+                    if (g_connected[1 - ci]) switchActive(CLIENT_OF(1 - ci));
+                }
+            }
+        }
     }
 }
 
@@ -2941,7 +3074,9 @@ static void videoRecvThread(void* arg)
             static u8 spill[VSLOT];
             bool full = next == __atomic_load_n(&g_vringTail, __ATOMIC_ACQUIRE);
             u8* dst = full ? spill : g_vring[head];
-            ssize_t n = recvfrom(g_videoFd, dst, VSLOT, 0, NULL, NULL);
+            struct sockaddr_in vfrom;
+            socklen_t vflen = sizeof(vfrom);
+            ssize_t n = recvfrom(g_videoFd, dst, VSLOT, 0, (struct sockaddr*)&vfrom, &vflen);
             if (n <= 0) break;
             got++;
             if (n == 8 || n == 16)
@@ -2978,6 +3113,12 @@ static void videoRecvThread(void* arg)
                     }
                     continue;
                 }
+            }
+            /* a picture from the emulator that is not the active one (both connected, just
+               switched): not ours to show */
+            {
+                u16 ap = g_activeUdpPort;
+                if (ap && vfrom.sin_port != ap) continue;
             }
             if ((size_t)n >= sizeof(LinkFramePacket))
             {
@@ -3255,9 +3396,14 @@ static bool mapTouch(u16 px, u16 py, bool zoom, u16* dx, u16* dy)
 static void inputThread(void* arg)
 {
     (void)arg;
+    /* the UDP address of each emulator (CI); the active one gets the buttons */
+    struct sockaddr_in peers[2];
+    bool havePeers[2] = { false, false };
+    u64 lastHellos[2] = { 0, 0 };
+    u32 idleId = 0;
+    u64 lastIdleSend = 0;
     struct sockaddr_in peer;
     bool havePeer = false;
-    u64 lastHello = 0;
     u32 packetId = 0;
     int quitHold = 0;
     bool comboSeen = false, quitSeen = false;
@@ -3350,20 +3496,42 @@ static void inputThread(void* arg)
         if (!g_bulkActive && ++heloCheck >= 48)   /* every ~48 ms (loop: 1 ms) */
         for (heloCheck = 0;;)
         {
-            uint32_t msg = 0;
+            uint32_t msg[2] = { 0, 0 };
             struct sockaddr_in from;
             socklen_t flen = sizeof(from);
-            ssize_t n = recvfrom(g_udpFd, &msg, sizeof(msg), 0, (struct sockaddr*)&from, &flen);
+            ssize_t n = recvfrom(g_udpFd, msg, sizeof(msg), 0, (struct sockaddr*)&from, &flen);
             if (n <= 0) break;
-            if (n == sizeof(msg) && msg == LINK_UDP_HELLO)
+            if ((n == 4 || n == 8) && msg[0] == LINK_UDP_HELLO)
             {
-                peer = from;
-                havePeer = true;
-                lastHello = osGetTime();
+                /* + which emulator it is (older ones: the active one) */
+                int c = n == 8 ? CI(msg[1]) : CI(g_client);
+                peers[c] = from;
+                havePeers[c] = true;
+                lastHellos[c] = osGetTime();
             }
         }
-        if (g_bulkActive) lastHello = osGetTime();   /* we were not looking */
-        if (havePeer && osGetTime() - lastHello > 5000) havePeer = false;
+        for (int c = 0; c < 2; c++)
+        {
+            if (g_bulkActive) lastHellos[c] = osGetTime();   /* we were not looking */
+            if (havePeers[c] && osGetTime() - lastHellos[c] > 5000) havePeers[c] = false;
+        }
+        const int act = CI(g_client);
+        peer = peers[act];
+        havePeer = havePeers[act];
+        g_activeUdpPort = havePeer ? peer.sin_port : 0;
+        /* the other emulator: only the state of the console, every 50 ms, no buttons */
+        if (havePeers[1 - act] && !g_bulkActive && osGetTime() - lastIdleSend >= 50)
+        {
+            LinkInputPacket ip;
+            memset(&ip, 0, sizeof(ip));
+            ip.magic = LINK_MAGIC;
+            ip.id = idleId++;
+            ip.flags = LINK_INPUT_IDLE;
+            ip.status = (u32)g_battery | ((u32)g_wifi << 8) | (g_charging ? LINK_STATUS_CHARGING : 0) |
+                        (g_lidClosed ? LINK_STATUS_LIDCLOSED : 0);
+            sendto(g_udpFd, &ip, sizeof(ip), 0, (struct sockaddr*)&peers[1 - act], sizeof(peers[1 - act]));
+            lastIdleSend = osGetTime();
+        }
 
         touchPosition touch;
         circlePosition cpad, cstick;
@@ -3764,6 +3932,8 @@ int main(int argc, char** argv)
     irrstInit();   /* C-stick / ZL / ZR on New 3DS */
     LightLock_Init(&g_lock);
     LightLock_Init(&g_ackLock);
+    LightLock_Init(&g_cmdLock);
+    LightLock_Init(&g_acceptLock);
     static aptHookCookie hookCookie;
     aptHook(&hookCookie, aptHookFunc, NULL);
     loadConfig();
@@ -3818,7 +3988,9 @@ int main(int argc, char** argv)
     /* taking packets from the socket is tiny work: above the main thread, so the
        socket buffer is emptied even while the main thread or the decoder is busy */
     Thread vrx = threadCreate(videoRecvThread, NULL, 0x4000, prio - 1, -2, false);
-    Thread srv = threadCreate(serverThread, NULL, 0x4000, prio + 1, -2, false);
+    Thread srvs[SERVER_SLOTS];
+    for (int i = 0; i < SERVER_SLOTS; i++)
+        srvs[i] = threadCreate(serverThread, (void*)(intptr_t)i, 0x4000, prio + 1, -2, false);
 
     u32 lastVideoFrames = (u32)-1;
     bool lastZoom = !g_zoom, lastHaveVideo = true;
@@ -4031,7 +4203,7 @@ int main(int argc, char** argv)
         {
             /* reconnected while playing: melonDS may continue (it pauses when the 3DS goes away) */
             g_sessionSame = false;
-            if (!g_menuOpen && !g_linkMenuOpen && g_localAsk == LA_NONE) g_haveResumeEv = true;
+            if (!g_menuOpen && !g_linkMenuOpen && g_localAsk == LA_NONE) g_haveResumeEv |= ACTIVE_BIT;
         }
         if (g_sessionEnded)
         {
@@ -4079,7 +4251,7 @@ int main(int argc, char** argv)
         if (g_wokeUp)
         {
             u64 now = osGetTime();
-            if (g_tcpConnected) { g_wokeUp = false; wakeTries = 0; wifiSince = 0; }
+            if (g_connected[0] || g_connected[1]) { g_wokeUp = false; wakeTries = 0; wifiSince = 0; }
             else if (now - lastWakeCheck >= 250)
             {
                 lastWakeCheck = now;
@@ -4145,7 +4317,7 @@ int main(int argc, char** argv)
         if (!native) items[itemCount++] = MI_SHOTMODE;
         /* backups: of the running game, else of the game selected in the list */
         int bakGame = -1;
-        if (g_gameStarted)
+        if (g_gameStarted && !native)
         {
             for (int i = 0; i < g_gameCount && bakGame < 0; i++)
             {
@@ -4153,12 +4325,14 @@ int main(int argc, char** argv)
                 if (l > 4 && strlen(g_currentGame) == l - 4 && strncmp(g_games[i], g_currentGame, l - 4) == 0) bakGame = i;
             }
         }
-        else if (g_tab == 0 && menuCursor >= 0 && menuCursor < g_gameCount) bakGame = menuCursor;
+        else if (g_tab == 0 && (native || !g_gameStarted) && menuCursor >= 0 && menuCursor < g_gameCount) bakGame = menuCursor;
         /* Azahar: the game selected in the 3DS tab, while none runs (its save is in use then) */
         int bakLib = -1;
-        if (native && !g_gameStarted && g_tab == 1 && menuCursor >= 0 && menuCursor < g_libCount) bakLib = menuCursor;
-        if (bakGame >= 0 && g_tcpConnected && !g_launchPending && !native) items[itemCount++] = MI_BACKUPS;
-        else if (bakLib >= 0 && g_tcpConnected && !g_launchPending) items[itemCount++] = MI_BACKUPS;
+        bool azRuns = native ? g_gameStarted : g_saved[1].started;
+        if (!azRuns && g_tab == 1 && menuCursor >= 0 && menuCursor < g_libCount) bakLib = menuCursor;
+        if (g_tab == 1) bakGame = -1;   /* the 3DS list: Azahar's backups */
+        if (bakGame >= 0 && g_connected[0] && !g_launchPending) items[itemCount++] = MI_BACKUPS;
+        else if (bakLib >= 0 && g_connected[1] && !g_launchPending) items[itemCount++] = MI_BACKUPS;
         if (!native) items[itemCount++] = MI_DISPLAY;
         items[itemCount++] = MI_BOTTOM;
         items[itemCount++] = MI_TOPOFF;
@@ -4181,7 +4355,7 @@ int main(int argc, char** argv)
                 LightLock_Lock(&g_lock);
                 g_answerId = g_askId;
                 g_answerChoice = (mk & KEY_A) ? 0 : 1;
-                g_haveAnswer = true;
+                g_haveAnswer = (u8)(1u << g_askClient);
                 g_askActive = false;
                 LightLock_Unlock(&g_lock);
             }
@@ -4197,7 +4371,7 @@ int main(int argc, char** argv)
                 switch (localAsk)
                 {
                 case LA_RESUME:
-                    if (yes) { g_menuOpen = false; g_haveResumeEv = true; }
+                    if (yes) { g_menuOpen = false; g_haveResumeEv |= ACTIVE_BIT; }
                     else g_menuOpen = true;
                     break;
                 case LA_SWITCH:
@@ -4208,7 +4382,7 @@ int main(int argc, char** argv)
                     if (yes)
                     {
                         LightLock_Lock(&g_lock);
-                        g_haveStopEv = true;
+                        g_haveStopEv |= ACTIVE_BIT;
                         snprintf(g_statusText, sizeof(g_statusText), "%s", T(S_STOPPING));
                         LightLock_Unlock(&g_lock);
                         g_linkMenuOpen = false;
@@ -4221,7 +4395,7 @@ int main(int argc, char** argv)
                     if (yes)
                     {
                         LightLock_Lock(&g_lock);
-                        g_haveRestoreEv = true;
+                        g_haveRestoreEv |= (u8)(1u << g_bakClient);
                         snprintf(g_statusText, sizeof(g_statusText), "%s", T(S_RESTORING));
                         LightLock_Unlock(&g_lock);
                         g_bakOpen = false;
@@ -4243,7 +4417,7 @@ int main(int argc, char** argv)
                 case MI_BACK:
                     g_linkMenuOpen = false;
                     g_menuOpen = false;
-                    g_haveResumeEv = true;
+                    g_haveResumeEv |= ACTIVE_BIT;
                     break;
                 case MI_GAMES: g_linkMenuOpen = false; g_menuOpen = true; break;
                 case MI_DISPLAY: g_zoom = !g_zoom; break;
@@ -4265,7 +4439,7 @@ int main(int argc, char** argv)
                     break;
                 case MI_BOTTOM:
                     g_videoOff = !g_videoOff;
-                    g_haveVideoEv = true;
+                    g_haveVideoEv |= 3;
                     saveConfig();
                     break;
                 case MI_TOPOFF:
@@ -4274,7 +4448,7 @@ int main(int argc, char** argv)
                     break;
                 case MI_SHOT:
                     LightLock_Lock(&g_lock);
-                    g_haveShot = true;
+                    g_haveShot |= ACTIVE_BIT;
                     snprintf(g_statusText, sizeof(g_statusText), "%s", T(S_SHOT_REQ));
                     LightLock_Unlock(&g_lock);
                     CLOSE_MENU();
@@ -4282,7 +4456,7 @@ int main(int argc, char** argv)
                 case MI_LANG:
                     g_lang = (g_lang + 1) % LANG_COUNT;
                     applyLanguage();
-                    g_haveLangEvent = true;
+                    g_haveLangEvent |= 3;
                     saveConfig();
                     break;
                 case MI_STOP: g_localAsk = LA_STOP; break;
@@ -4293,7 +4467,8 @@ int main(int argc, char** argv)
                     g_bakCount = 0;
                     g_bakCursor = 0;
                     g_bakWaiting = true;
-                    g_haveBakReqEv = true;
+                    g_bakClient = bakLib >= 0 ? 1 : 0;   /* 3DS tab: Azahar, else melonDS */
+                    g_haveBakReqEv = (u8)(1u << g_bakClient);
                     LightLock_Unlock(&g_lock);
                     g_linkMenuOpen = false;
                     g_bakOpen = true;
@@ -4356,10 +4531,10 @@ int main(int argc, char** argv)
                 int i = findLib(keep);
                 if (i >= 0) menuCursor = i;
             }
-            if (g_tab == 1 && (mk & KEY_Y) && native && g_tcpConnected)
+            if (g_tab == 1 && (mk & KEY_Y) && g_connected[1])
             {
                 LightLock_Lock(&g_lock);
-                g_haveLibReqEv = true;   /* Azahar sends its list again */
+                g_haveLibReqEv |= (1u << 1);   /* Azahar sends its list again */
                 LightLock_Unlock(&g_lock);
             }
             if ((mk & KEY_A) && listCount > 0)
@@ -4372,16 +4547,31 @@ int main(int argc, char** argv)
                     size_t bl = strlen(base);
                     if (bl > 4) base[bl - 4] = 0;
                 }
+                bool otherRuns = false;   /* the game runs in the emulator of this tab (not active) */
                 if ((g_tab == 1) != native)
                 {
-                    /* the other emulator is connected: it cannot start this game
-                       (the line under the list says which one is needed) */
+                    LightLock_Lock(&g_lock);
+                    otherRuns = g_saved[g_tab].started && strcmp(base, g_saved[g_tab].game) == 0;
+                    LightLock_Unlock(&g_lock);
                 }
+                if (!g_connected[g_tab])
+                {
+                    /* the emulator for this tab is not connected (the line under the list
+                       says which one is needed) */
+                }
+                else if (otherRuns)
+                {
+                    /* it runs in the other emulator: switch over and go back to it */
+                    switchActive(CLIENT_OF(g_tab));
+                    g_menuOpen = false;
+                    g_haveResumeEv |= (u8)(1u << g_tab);
+                }
+                else if ((g_tab == 1) != native) { if (g_tab == 1) requestLaunchLib(menuCursor); else { requestLaunch(menuCursor); saveConfig(); } }
                 else if (g_gameStarted && strcmp(base, g_currentGame) == 0)
                 {
                     /* the game that runs anyway: just go back to it, never restart it */
                     g_menuOpen = false;
-                    g_haveResumeEv = true;
+                    g_haveResumeEv |= ACTIVE_BIT;
                 }
                 else if (g_gameStarted)
                 {
@@ -4397,7 +4587,7 @@ int main(int argc, char** argv)
                     saveConfig();      /* remembers the last game */
                 }
             }
-            else if ((mk & KEY_B) && g_gameStarted) { g_menuOpen = false; g_haveResumeEv = true; }
+            else if ((mk & KEY_B) && g_gameStarted) { g_menuOpen = false; g_haveResumeEv |= ACTIVE_BIT; }
         }
 
         /* ---------------- top screen ---------------- */
@@ -4427,9 +4617,15 @@ int main(int argc, char** argv)
             setLine(1, "\x1b[36m%s\x1b[0m  \x1b[90mv%u%s", T(S_TITLE), (unsigned)LINK_VERSION, st);
         }
         setLine(3, "%-12s \x1b[33m%s", T(S_IP), inet_ntoa(ip));
-        char emuLabel[16];
-        snprintf(emuLabel, sizeof(emuLabel), "%s:", emulatorName());
-        setLine(4, "%-12s %s%s", emuLabel, g_tcpConnected ? "\x1b[32m" : "\x1b[90m", g_tcpConnected ? T(S_CONNECTED) : T(S_WAITING));
+        /* both emulators: connected or not; the active one (buttons, picture) marked */
+        {
+            char st[2][40];
+            for (int i = 0; i < 2; i++)
+                snprintf(st[i], sizeof(st[i]), "%s%s%s", g_connected[i] ? "\x1b[32m" : "\x1b[90m",
+                         g_connected[i] ? T(S_CONNECTED) : T(S_WAITING),
+                         g_connected[i] && CI(g_client) == i && g_connected[1 - i] ? "*" : "");
+            setLine(4, "%-12s %s\x1b[0m   Azahar: %s", "melonDS:", st[0], st[1]);
+        }
         setLine(5, "%-12s %s%s\x1b[0m   %s %s%s", T(S_CONTROLS), in.haveUdpPeer ? "\x1b[32m" : "\x1b[90m",
                 in.haveUdpPeer ? T(S_ACTIVE) : "-", T(S_PICTURE), haveVideo ? "\x1b[32m" : "\x1b[90m", haveVideo ? "ok" : "-");
         setLine(6, "%-12s %s", T(S_DISPLAY), zoom && !native ? T(S_ENLARGED) : T(S_ORIGINAL));
@@ -4636,7 +4832,7 @@ int main(int argc, char** argv)
                     setLine(11 + r, "\x1b[31m  %s", T(g_tab == 1 ? S_NO_LIB : S_NO_GAMES));
                 else setLine(11 + r, "");
             }
-            if ((g_tab == 1) != native || !g_tcpConnected)
+            if (!g_connected[g_tab])
                 setLine(25, "\x1b[33m%s", T(g_tab == 1 ? S_NEED_AZAHAR : S_NEED_MELONDS));
             else setLine(25, "\x1b[32m%s", T(g_tab == 1 ? S_ON3DS : S_PC_COPIED));
             setLine(26, "\x1b[90m%s", g_gameStarted ? T(S_LIST_HINT_BACK) : T(S_LIST_HINT));
@@ -4651,7 +4847,7 @@ int main(int argc, char** argv)
 
         setLine(28, "\x1b[90m%s", T(S_HINT_MENU));
         setLine(29, "\x1b[90m%s", isNew3DS && !native ? T(S_HINT_CSTICK) : "");
-        setLine(30, "\x1b[90m%s", g_tcpConnected ? "" : T(S_HINT_CONNECT));
+        setLine(30, "\x1b[90m%s", g_connected[0] || g_connected[1] ? "" : T(S_HINT_CONNECT));
 
         gfxFlushBuffers();
         gfxSwapBuffers();
@@ -4667,11 +4863,11 @@ int main(int argc, char** argv)
     threadJoin(vrx, U64_MAX);
     /* a blocking send could still be waiting for the PC: give it 2 s, then
        socExit() below tears the sockets down anyway */
-    threadJoin(srv, 2000000000LL);
+    for (int i = 0; i < SERVER_SLOTS; i++) threadJoin(srvs[i], 2000000000LL);
     threadFree(inp);
     threadFree(vid);
     threadFree(vrx);
-    threadFree(srv);
+    for (int i = 0; i < SERVER_SLOTS; i++) threadFree(srvs[i]);
     close(g_udpFd);
     close(g_videoFd);
     socExit();
