@@ -115,6 +115,9 @@ enum StrId
     S_TAB_DS, S_TAB_3DS, S_NO_LIB, S_NEED_MELONDS, S_NEED_AZAHAR, S_ON3DS,
     S_M_GLITCH, S_GLITCH_ALLOW, S_GLITCH_NEVER,
     S_M_PACE, S_PACE_EVEN, S_PACE_FAST,
+    S_M_CLOCK, S_C_NONE, S_C_INFO, S_C_DAY, S_C_DAYS, S_C_FWD, S_C_BACK, S_C_REAL, S_C_PEN1,
+    S_C_PEN2, S_C_PENHINT, S_C_PC, S_C_SHIFT, S_C_HINT, S_C_SHIFTHINT, S_C_JUMPLINE, S_C_BLOCK,
+    S_C_NOCHANGE,
     S_COUNT
 };
 
@@ -146,6 +149,12 @@ static const char* const g_strs[LANG_COUNT][S_COUNT] = {
         "3DS = also installed on this 3DS",
         "Picture glitches", "allow (smoother)", "never (pauses briefly)",
         "Picture timing", "even (recommended)", "fast (may stutter)",
+        "Clock / time jump", "Time jump: none (real time)", "Time jump: %s", "%+d day", "%+d days",
+        "1 day forward", "1 day back", "Back to the real time", "Remove lock - step 1: %d days back",
+        "Remove lock - step 2: real time", "Then start the game once, then step 2",
+        "Clock from the PC", "Own shift: %+d h", "L+R+A: do it (the 3DS restarts)  B back",
+        "A +1 h   Y -1 h   B back", "Time jump %s", "Time jump on: the PC cannot connect",
+        "The clock is already right",
     },
     {   /* Deutsch */
         "melonDS Link", "IP-Adresse:", "verbunden", "wartet...", "Steuerung:", "aktiv", "Bild:",
@@ -175,6 +184,12 @@ static const char* const g_strs[LANG_COUNT][S_COUNT] = {
         "3DS = auch auf diesem 3DS installiert",
         "Bildfehler", "erlauben (flüssiger)", "nie (hält kurz an)",
         "Bild-Takt", "gleichmäßig (empfohlen)", "schnell (kann ruckeln)",
+        "Uhrzeit / Zeitsprung", "Zeitsprung: keiner (echte Zeit)", "Zeitsprung: %s", "%+d Tag", "%+d Tage",
+        "1 Tag vor", "1 Tag zurück", "Zurück auf echte Zeit", "Sperre entfernen 1: %d Tage zurück",
+        "Sperre entfernen 2: echte Zeit", "Dann Spiel einmal starten, dann Schritt 2",
+        "Uhr vom PC übernehmen", "Eigene Verschiebung: %+d h", "L+R+A: ausführen (3DS startet neu)  B zurück",
+        "A +1 h   Y -1 h   B zurück", "Zeitsprung %s", "Zeitsprung aktiv: PC kann nicht verbinden",
+        "Die Uhr stimmt schon",
     },
 };
 static char g_tr[S_COUNT][80];   /* current language, already in code page 437 */
@@ -198,6 +213,9 @@ static const char* const g_strKeys[S_COUNT] = {
     "tab_ds", "tab_3ds", "no_library", "need_melonds", "need_azahar", "on_3ds",
     "menu_glitch", "glitch_allow", "glitch_never",
     "menu_pace", "pace_even", "pace_fast",
+    "menu_clock", "clock_none", "clock_info", "clock_day", "clock_days", "clock_fwd", "clock_back",
+    "clock_real", "clock_penalty1", "clock_penalty2", "clock_penalty_hint", "clock_pc", "clock_shift",
+    "clock_hint", "clock_shift_hint", "clock_jump_line", "clock_block", "clock_nochange",
 };
 /* the files carry a fingerprint of the built-in texts: when an app update
    changes a text, they are written anew (so the change shows up) */
@@ -480,6 +498,19 @@ static volatile u8 g_battery = 255, g_wifi = 255;
 static volatile bool g_charging = false, g_lidClosed = false;
 static volatile bool g_keepAwake = false;        /* closing the 3DS keeps the game running (the active emulator's setting) */
 static volatile bool g_keepAwakeOf[2] = { false, false };   /* each emulator's setting */
+
+/* the clock (link menu > Clock): a time jump made here moves the raw RTC (like RTChanger,
+   the 3DS restarts); remembered so it can be undone. While one is on, no PC may connect
+   (it would get saves of another day). */
+static s64 g_ownJump = 0;                 /* seconds the RTC is ahead of the real time */
+static int g_penaltyStep = 0;             /* "remove the lock": 1 = step 1 done */
+static int g_penaltyDays = 3;
+static int g_clockShiftH = 0;             /* own shift for "clock from the PC", hours */
+static volatile s64 g_emuJump[2] = { 0, 0 };   /* the time jump of each emulator (shown) */
+static volatile s64 g_pcLocalMs = 0;      /* the PC's local time (LinkOptionsExt) ... */
+static volatile u64 g_pcLocalAt = 0;      /* ... and our osGetTime when it came (0 = none) */
+static volatile bool g_jumpRefused = false;    /* a PC was turned away (time jump on) */
+static volatile bool g_clockOpen = false;   /* the clock screen (link menu > Clock) */
 static volatile u32 g_sockGen = 0;               /* bumped after waking up: sockets are made anew */
 static volatile bool g_netPause = false;         /* the socket service is being restarted: hands off */
 static volatile bool g_wokeUp = false;           /* woke up, not yet connected to melonDS again */
@@ -1288,6 +1319,12 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload, int* ci
         snprintf(r.lang, sizeof(r.lang), "%s", g_langCodes[g_lang]);
         r.flags = g_videoOff ? LINK_HELLO_VIDEO_OFF : 0;
         uint32_t ver = (h->len >= 4) ? *(uint32_t*)payload : 0;
+        if (ver == LINK_VERSION && g_ownJump != 0)
+        {
+            /* a time jump is on here: undo it first (the PC would get saves of another day) */
+            g_jumpRefused = true;
+            return sendResponse(fd, h, LINK_ERR_TIMEJUMP, &r, sizeof(r));
+        }
         if (ver == LINK_VERSION)
         {
             uint32_t client = (h->len >= 8) ? ((uint32_t*)payload)[1] : LINK_CLIENT_MELONDS;
@@ -1590,6 +1627,15 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload, int* ci
         int c = *ci < 0 ? CI(g_client) : *ci;
         g_keepAwakeOf[c] = (opts & LINK_OPT_KEEP_AWAKE) != 0;
         if (CLIENT_OF(c) == g_client) g_keepAwake = g_keepAwakeOf[c];
+        if (h->len >= 4 + sizeof(LinkOptionsExt))
+        {
+            /* newer emulators: their time jump (shown) and the PC's local time */
+            LinkOptionsExt ext;
+            memcpy(&ext, payload + 4, sizeof(ext));
+            g_emuJump[c] = ext.timeJump;
+            g_pcLocalMs = ext.pcLocalMs;
+            g_pcLocalAt = osGetTime();
+        }
         return sendResponse(fd, h, LINK_OK, NULL, 0);
     }
 
@@ -1744,7 +1790,8 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload, int* ci
         /* then, for finding out what the clock values mean (LINK_TIME_UNKNOWN where not
            readable): the raw RTC from the MCU registers, the RTC as the system (PTM)
            reads it, and config block 0x30002 */
-        u64 t[5] = { osGetTime(), LINK_TIME_UNKNOWN, LINK_TIME_UNKNOWN, LINK_TIME_UNKNOWN, LINK_TIME_UNKNOWN };
+        u64 t[6] = { osGetTime(), LINK_TIME_UNKNOWN, LINK_TIME_UNKNOWN, LINK_TIME_UNKNOWN, LINK_TIME_UNKNOWN,
+                     (u64)g_ownJump };
         if (R_SUCCEEDED(cfguInit()))
         {
             u64 v = 0;
@@ -3494,13 +3541,13 @@ static void inputThread(void* arg)
 
         /* C-stick down opens/closes the game list */
         bool dialog = g_askActive || g_localAsk != LA_NONE;
-        bool capture = g_menuOpen || g_linkMenuOpen || g_bakOpen || dialog;
+        bool capture = g_menuOpen || g_linkMenuOpen || g_bakOpen || g_clockOpen || dialog;
         /* with a 3DS game (Azahar) the C-stick belongs to the game */
         bool native = NATIVE();
         if ((down & KEY_CSTICK_UP) && !dialog && !native) g_zoom = !g_zoom;
         if ((down & KEY_CSTICK_DOWN) && !dialog && !native)
         {
-            if (!g_menuOpen) { g_menuOpen = true; g_linkMenuOpen = false; g_bakOpen = false; }
+            if (!g_menuOpen) { g_menuOpen = true; g_linkMenuOpen = false; g_bakOpen = false; g_clockOpen = false; }
             else if (g_gameStarted) g_menuOpen = false;
         }
         else if (capture)
@@ -3816,6 +3863,7 @@ static void loadConfig(void)
     while (fgets(line, sizeof(line), f))
     {
         int v;
+        long long ll;
         char dir[128];
         if (sscanf(line, "zoom=%d", &v) == 1) g_zoom = v != 0;
         else if (sscanf(line, "videooff=%d", &v) == 1) g_videoOff = v != 0;
@@ -3823,6 +3871,10 @@ static void loadConfig(void)
         else if (sscanf(line, "statusbar=%d", &v) == 1) g_statusBar = v != 0;
         else if (sscanf(line, "glitch=%d", &v) == 1) g_allowGlitch = v != 0;
         else if (sscanf(line, "fastpic=%d", &v) == 1) g_fastPic = v != 0;
+        else if (sscanf(line, "timejump=%lld", &ll) == 1) g_ownJump = (s64)ll;
+        else if (sscanf(line, "penaltystep=%d", &v) == 1) g_penaltyStep = v;
+        else if (sscanf(line, "penaltydays=%d", &v) == 1) g_penaltyDays = v >= 1 && v <= 30 ? v : 3;
+        else if (sscanf(line, "clockshift=%d", &v) == 1) g_clockShiftH = v >= -12 && v <= 14 ? v : 0;
         else if (sscanf(line, "lang=%d", &v) == 1) g_lang = v;
         else if (sscanf(line, "client=%d", &v) == 1) g_client = v == (int)LINK_CLIENT_AZAHAR ? LINK_CLIENT_AZAHAR : LINK_CLIENT_MELONDS;
         else if (strncmp(line, "last=", 5) == 0)
@@ -3850,6 +3902,10 @@ static void saveConfig(void)
     fprintf(f, "statusbar=%d\n", g_statusBar ? 1 : 0);
     fprintf(f, "glitch=%d\n", g_allowGlitch ? 1 : 0);
     fprintf(f, "fastpic=%d\n", g_fastPic ? 1 : 0);
+    fprintf(f, "timejump=%lld\n", (long long)g_ownJump);
+    fprintf(f, "penaltystep=%d\n", g_penaltyStep);
+    fprintf(f, "penaltydays=%d\n", g_penaltyDays);
+    fprintf(f, "clockshift=%d\n", g_clockShiftH);
     fprintf(f, "lang=%d\n", g_lang);
     fprintf(f, "client=%d\n", (int)g_client);
     fprintf(f, "romdir=%s\n", g_romDir);
@@ -3889,6 +3945,112 @@ static bool readRawRtc(u64* ms)
     if (mon < 1 || mon > 12 || day < 1 || day > 31 || hour > 23 || min > 59 || sec > 59)
         return false;
     *ms = (u64)(((daysSince1900(year, mon, day) * 24 + hour) * 60 + min) * 60 + sec) * 1000;
+    return true;
+}
+
+/* a day number since 1900-01-01 back to a date */
+static void dateFromDays1900(s64 z, int* y, int* m, int* d)
+{
+    z += 719468 - 25567;   /* days since 0000-03-01 */
+    const s64 era = (z >= 0 ? z : z - 146096) / 146097;
+    const unsigned doe = (unsigned)(z - era * 146097);
+    const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const unsigned mp = (5 * doy + 2) / 153;
+    *d = (int)(doy - (153 * mp + 2) / 5 + 1);
+    *m = (int)(mp < 10 ? mp + 3 : mp - 9);
+    *y = (int)(yoe + era * 400) + (*m <= 2);
+}
+
+/* moves the raw RTC (MCU registers 0x30..0x36) by `seconds`, like RTChanger. The system
+   reads it at start, so the 3DS has to restart afterwards. */
+static bool shiftRawRtc(s64 seconds)
+{
+    u64 ms;
+    if (!readRawRtc(&ms)) return false;
+    s64 t = (s64)(ms / 1000) + seconds;
+    if (t < 0) return false;
+    int y, mo, d;
+    dateFromDays1900(t / 86400, &y, &mo, &d);
+    if (y < 2000 || y > 2099) return false;   /* what the RTC can hold */
+    const int rest = (int)(t % 86400);
+    u8 r[7];
+    bool ok = false;
+    if (R_SUCCEEDED(mcuHwcInit()))
+    {
+        if (R_SUCCEEDED(MCUHWC_ReadRegister(0x30, r, sizeof(r))))   /* keeps byte 3 */
+        {
+#define TOBCD(x) (u8)((((x) / 10) << 4) | ((x) % 10))
+            r[0] = TOBCD(rest % 60);
+            r[1] = TOBCD(rest / 60 % 60);
+            r[2] = TOBCD(rest / 3600);
+            r[4] = TOBCD(d);
+            r[5] = TOBCD(mo);
+            r[6] = TOBCD(y - 2000);
+#undef TOBCD
+            ok = R_SUCCEEDED(MCUHWC_WriteRegister(0x30, r, sizeof(r)));
+        }
+        mcuHwcExit();
+    }
+    return ok;
+}
+
+/* "+1 day", "-3 days" */
+static void jumpText(char* out, size_t n, s64 seconds)
+{
+    int days = (int)(seconds / 86400);
+    int hours = (int)(seconds % 86400 / 3600);
+    if (hours != 0 && days == 0) snprintf(out, n, "%+d h", hours);
+    else snprintf(out, n, T(days == 1 || days == -1 ? S_C_DAY : S_C_DAYS), days);
+}
+
+/* the clock menu */
+enum { CL_FWD, CL_BACK, CL_REAL, CL_PENALTY, CL_PC, CL_SHIFT };
+static int clockItems(int* items)
+{
+    int n = 0;
+    items[n++] = CL_FWD;
+    items[n++] = CL_BACK;
+    if (g_ownJump != 0) items[n++] = CL_REAL;
+    items[n++] = CL_PENALTY;
+    /* the PC's time: only without a time jump (and once a PC told it) */
+    if (g_ownJump == 0 && g_pcLocalAt != 0) { items[n++] = CL_PC; items[n++] = CL_SHIFT; }
+    return n;
+}
+
+/* does it (L + R + A): moves the RTC and restarts the 3DS. false: nothing to do / failed */
+static bool clockAction(int item)
+{
+    s64 move = 0, jump = g_ownJump;
+    int step = g_penaltyStep;
+    switch (item)
+    {
+    case CL_FWD: move = 86400; break;
+    case CL_BACK: move = -86400; break;
+    case CL_REAL: move = -g_ownJump; step = 0; break;
+    case CL_PENALTY:
+        if (g_penaltyStep == 0) { move = -(s64)g_penaltyDays * 86400 - g_ownJump; step = 1; }
+        else { move = -g_ownJump; step = 0; }
+        break;
+    case CL_PC:
+    {
+        /* the clock the games see (RTC + the user's offset) = the PC's local time (+ own shift) */
+        u64 now = osGetTime();
+        s64 want = g_pcLocalMs + (s64)(now - g_pcLocalAt) + (s64)g_clockShiftH * 3600000;
+        s64 d = want - (s64)now;
+        move = (d >= 0 ? d + 500 : d - 500) / 1000;
+        if (move > -2 && move < 2) return false;   /* right already */
+        break;
+    }
+    default: return false;
+    }
+    if (item != CL_PC) jump += move;
+    if (move == 0) return false;
+    if (!shiftRawRtc(move)) return false;
+    g_ownJump = jump;
+    g_penaltyStep = step;
+    saveConfig();
+    APT_HardwareResetAsync();   /* the system reads the RTC when it starts */
     return true;
 }
 
@@ -4017,7 +4179,7 @@ int main(int argc, char** argv)
     u32 lastVideoFrames = (u32)-1;
     bool lastZoom = !g_zoom, lastHaveVideo = true;
     bool savedZoom = g_zoom;
-    int menuCursor = 0, menuTop = 0, linkCursor = 0;
+    int menuCursor = 0, menuTop = 0, linkCursor = 0, clockCursor = 0;
     u64 lastStateRead = 0, lastBatteryRead = 0, lastWakeTry = 0, lastWakeCheck = 0, wifiSince = 0;
     int wakeTries = 0;
     bool sleepApplied = false, keepAwakeApplied = false, wasLidDark = false;
@@ -4265,15 +4427,17 @@ int main(int argc, char** argv)
             g_menuToggle = false;
             if (!askActive && localAsk == LA_NONE)
             {
-                if (g_linkMenuOpen)
+                if (g_linkMenuOpen || g_clockOpen)
                 {
                     g_linkMenuOpen = false;
+                    g_clockOpen = false;
                     if (!g_gameStarted) g_menuOpen = true;
                 }
                 else
                 {
                     g_linkMenuOpen = true;
                     g_menuOpen = false;
+                    g_bakOpen = false;
                     linkCursor = 0;
                 }
             }
@@ -4339,12 +4503,12 @@ int main(int argc, char** argv)
         if (lidDark) setTopBacklight(false);
         else if (wasLidDark) setTopBacklight(true);
         wasLidDark = lidDark;
-        if (!lidDark && g_topOff && (g_menuOpen || g_linkMenuOpen || askActive || localAsk != LA_NONE)) setTopBacklight(true);
+        if (!lidDark && g_topOff && (g_menuOpen || g_linkMenuOpen || g_clockOpen || askActive || localAsk != LA_NONE)) setTopBacklight(true);
         setBottomBacklight(!g_videoOff && !lidDark);
 
         /* the menu: only what makes sense right now */
-        enum { MI_BACK, MI_GAMES, MI_SHOT, MI_SHOTMODE, MI_BACKUPS, MI_DISPLAY, MI_BOTTOM, MI_TOPOFF, MI_STATUSBAR, MI_GLITCH, MI_PACE, MI_LANG, MI_STOP, MI_QUIT };
-        int items[13], itemCount = 0;
+        enum { MI_BACK, MI_GAMES, MI_SHOT, MI_SHOTMODE, MI_BACKUPS, MI_DISPLAY, MI_BOTTOM, MI_TOPOFF, MI_STATUSBAR, MI_GLITCH, MI_PACE, MI_CLOCK, MI_LANG, MI_STOP, MI_QUIT };
+        int items[15], itemCount = 0;
         bool playing = g_gameStarted && !g_launchPending;
         if (g_gameStarted) items[itemCount++] = MI_BACK;
         items[itemCount++] = MI_GAMES;
@@ -4374,6 +4538,7 @@ int main(int argc, char** argv)
         items[itemCount++] = MI_STATUSBAR;
         if (g_mvdReady && g_client == LINK_CLIENT_AZAHAR) items[itemCount++] = MI_GLITCH;
         if (!g_videoOff) items[itemCount++] = MI_PACE;
+        if (!g_gameStarted) items[itemCount++] = MI_CLOCK;   /* restarts the 3DS: not while playing */
         items[itemCount++] = MI_LANG;
         if (playing && g_tcpConnected) items[itemCount++] = MI_STOP;
         items[itemCount++] = MI_QUIT;
@@ -4495,6 +4660,7 @@ int main(int argc, char** argv)
                     saveConfig();
                     break;
                 case MI_STOP: g_localAsk = LA_STOP; break;
+                case MI_CLOCK: g_linkMenuOpen = false; g_clockOpen = true; clockCursor = 0; break;
                 case MI_BACKUPS:
                     LightLock_Lock(&g_lock);
                     if (bakLib >= 0) snprintf(g_bakRom, sizeof(g_bakRom), "%s", g_lib[bakLib].path);
@@ -4513,6 +4679,37 @@ int main(int argc, char** argv)
                     if (g_gameStarted || g_saveWriting) g_localAsk = LA_QUIT;
                     else g_running = false;
                     break;
+                }
+            }
+        }
+        else if (g_clockOpen && (mk || confirm))
+        {
+            int cl[8];
+            int cn = clockItems(cl);
+            if (clockCursor >= cn) clockCursor = cn - 1;
+            if (mk & (KEY_DUP | KEY_CPAD_UP)) clockCursor = (clockCursor + cn - 1) % cn;
+            if (mk & (KEY_DDOWN | KEY_CPAD_DOWN)) clockCursor = (clockCursor + 1) % cn;
+            if (mk & KEY_B) { g_clockOpen = false; g_linkMenuOpen = true; }
+            else if (cl[clockCursor] == CL_SHIFT && (mk & (KEY_A | KEY_Y)))
+            {
+                g_clockShiftH += (mk & KEY_A) ? 1 : -1;
+                if (g_clockShiftH > 14) g_clockShiftH = 14;
+                if (g_clockShiftH < -12) g_clockShiftH = -12;
+                saveConfig();
+            }
+            else if (confirm)
+            {
+                if (g_saveWriting)
+                {
+                    LightLock_Lock(&g_lock);
+                    snprintf(g_statusText, sizeof(g_statusText), "%s", T(S_D_SAVING));
+                    LightLock_Unlock(&g_lock);
+                }
+                else if (!clockAction(cl[clockCursor]))
+                {
+                    LightLock_Lock(&g_lock);
+                    snprintf(g_statusText, sizeof(g_statusText), "%s", T(S_C_NOCHANGE));
+                    LightLock_Unlock(&g_lock);
                 }
             }
         }
@@ -4651,6 +4848,30 @@ int main(int argc, char** argv)
             }
             setLine(1, "\x1b[36m%s\x1b[0m  \x1b[90mv%u%s", T(S_TITLE), (unsigned)LINK_VERSION, st);
         }
+        {
+            /* time jumps: ours and those of the emulators connected (none: empty) */
+            char l2[120] = "", jt[24];
+            if (g_ownJump != 0)
+            {
+                jumpText(jt, sizeof(jt), g_ownJump);
+                char who[40];
+                snprintf(who, sizeof(who), "3DS %s", jt);
+                snprintf(l2, sizeof(l2), T(S_C_JUMPLINE), who);
+                if (g_jumpRefused) snprintf(l2, sizeof(l2), "%s", T(S_C_BLOCK));
+            }
+            else
+                for (int i = 0; i < 2; i++)
+                    if (g_connected[i] && g_emuJump[i] != 0)
+                    {
+                        jumpText(jt, sizeof(jt), g_emuJump[i]);
+                        char who[40];
+                        snprintf(who, sizeof(who), "%s %s", i == 1 ? "Azahar" : "melonDS", jt);
+                        size_t len = strlen(l2);
+                        if (len == 0) snprintf(l2, sizeof(l2), T(S_C_JUMPLINE), who);
+                        else snprintf(l2 + len, sizeof(l2) - len, ", %s", who);
+                    }
+            setLine(2, "\x1b[35m%.49s", l2);
+        }
         setLine(3, "%-12s \x1b[33m%s", T(S_IP), inet_ntoa(ip));
         /* both emulators: connected or not; the active one (buttons, picture) marked */
         {
@@ -4772,6 +4993,7 @@ int main(int argc, char** argv)
                 case MI_PACE: snprintf(label, sizeof(label), "%s: %s", T(S_M_PACE), g_fastPic ? T(S_PACE_FAST) : T(S_PACE_EVEN)); break;
                 case MI_LANG: snprintf(label, sizeof(label), "%s: %s", T(S_M_LANG), T(S_LANGNAME)); break;
                 case MI_STOP: snprintf(label, sizeof(label), "%s", T(S_M_STOP)); break;
+                case MI_CLOCK: snprintf(label, sizeof(label), "%s", T(S_M_CLOCK)); break;
                 case MI_BACKUPS:
                 {
                     char nm[300];
@@ -4791,6 +5013,41 @@ int main(int argc, char** argv)
             }
             for (int r = 12 + itemCount; r < 26; r++) setLine(r, "");
             setLine(26, "\x1b[90m%s", T(S_MENU_HINT));
+        }
+        else if (g_clockOpen)
+        {
+            char jt[24], line[80];
+            if (g_ownJump == 0) snprintf(line, sizeof(line), "%s", T(S_C_NONE));
+            else { jumpText(jt, sizeof(jt), g_ownJump); snprintf(line, sizeof(line), T(S_C_INFO), jt); }
+            setLine(10, "\x1b[36m%s\x1b[0m", T(S_M_CLOCK));
+            setLine(11, "%s%.49s", g_ownJump ? "\x1b[35m" : "\x1b[90m", line);
+            setLine(12, "");
+            int cl[8];
+            int cn = clockItems(cl);
+            if (clockCursor >= cn) clockCursor = cn - 1;
+            for (int r = 0; r < 12; r++)
+            {
+                int row = 13 + r;
+                if (r >= cn) { setLine(row, ""); continue; }
+                char label[80];
+                switch (cl[r])
+                {
+                case CL_FWD: snprintf(label, sizeof(label), "%s", T(S_C_FWD)); break;
+                case CL_BACK: snprintf(label, sizeof(label), "%s", T(S_C_BACK)); break;
+                case CL_REAL: snprintf(label, sizeof(label), "%s", T(S_C_REAL)); break;
+                case CL_PENALTY:
+                    if (g_penaltyStep == 0) snprintf(label, sizeof(label), T(S_C_PEN1), g_penaltyDays);
+                    else snprintf(label, sizeof(label), "%s", T(S_C_PEN2));
+                    break;
+                case CL_PC: snprintf(label, sizeof(label), "%s", T(S_C_PC)); break;
+                case CL_SHIFT: snprintf(label, sizeof(label), T(S_C_SHIFT), g_clockShiftH); break;
+                default: label[0] = 0;
+                }
+                if (r == clockCursor) setLine(row, "\x1b[47;30m> %-46.46s", label);
+                else setLine(row, "  %-46.46s", label);
+            }
+            setLine(25, g_penaltyStep ? "\x1b[33m%.49s" : "", T(S_C_PENHINT));
+            setLine(26, "\x1b[90m%s", T(cl[clockCursor] == CL_SHIFT ? S_C_SHIFTHINT : S_C_HINT));
         }
         else if (g_bakOpen)
         {
