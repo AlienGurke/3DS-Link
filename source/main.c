@@ -4086,7 +4086,7 @@ static bool clockAction(int item)
 
 /* ------------------------------------------------------------------ */
 /* Activity Log. PTM keeps it (PlayHistory.dat, a ring of 12-byte entries: title id, then
-   4 bits event type and 28 bits minutes since 2000). Reading goes through ptm:plays;
+   4 bits event type and 28 bits minutes since 2000). Reading goes through ptm:play;
    adding goes through ptm:sysm NotifyPlayEvent (0x080E0140: type, program id, time) - the
    way the system notes every start and end of a program. Its arguments are not documented:
    the types are taken to be those of the stored entries, the time ms since 2000. So every
@@ -4094,10 +4094,18 @@ static bool clockAction(int item)
 #define PLAY_RING 0x11D28
 typedef struct { u32 tidHigh, tidLow, info; } PlayEntry;
 
+/* reading: "ptm:play" (or ptm:sysm, which has the same reading commands) */
+static Result playService(Handle* h)
+{
+    Result r = srvGetServiceHandle(h, "ptm:play");
+    if (R_FAILED(r)) r = srvGetServiceHandle(h, "ptm:sysm");
+    return r;
+}
+
 static Result playHistoryRead(s32 start, s32 count, PlayEntry* out)
 {
     Handle h;
-    Result r = srvGetServiceHandle(&h, "ptm:plays");
+    Result r = playService(&h);
     if (R_FAILED(r)) return r;
     u32* cmd = getThreadCommandBuffer();
     cmd[0] = IPC_MakeHeader(0x807, 2, 2);
@@ -4117,7 +4125,7 @@ static Result playHistoryRead(s32 start, s32 count, PlayEntry* out)
 static Result playHistoryWord(u32 header, s32* out)
 {
     Handle h;
-    Result r = srvGetServiceHandle(&h, "ptm:plays");
+    Result r = playService(&h);
     if (R_FAILED(r)) return r;
     u32* cmd = getThreadCommandBuffer();
     cmd[0] = header;
