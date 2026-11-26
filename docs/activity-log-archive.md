@@ -16,6 +16,8 @@ liest**. Sie reicht, um ein eigenes Dashboard oder Werkzeug dafür zu bauen.
 | `playhistory-copy.bin` | Kopie davon (zweite Sicherung auf der SD-Karte) | 3DS Link |
 | `clock.txt` | Zeitsprünge und Uhr-Korrekturen, mit Eintrags-Nummer | 3DS Link (Uhr-Menü) |
 | `titles.txt` | Title-ID → Spielname | 3DS Link (bei jedem Start, nur neue) |
+| `pld.dat` / `pld-erste.dat` | Daten der Aktivitätslog-App (siehe unten): neuester Stand / der erste je gesicherte, wird nie ersetzt | 3DS Link (bei jedem Start, nur wenn geändert) |
+| `Pedometer.dat` / `Pedometer-erste.dat` | Schrittzähler, unverändert aus dem System | 3DS Link (bei jedem Start, nur wenn geändert) |
 | `playhistory-pc.bin` | gespielt am PC ohne 3DS (Azahar), gleiches Format | Azahar Link (geplant) |
 
 Auf der SD-Karte liegen sie in `sdmc:/3ds/3DS-Link/activity/`.
@@ -126,6 +128,38 @@ anderen Tools (z. B. RTChanger) verstellt: nicht erkennbar.
 
 Text, UTF-8, eine Zeile pro Spiel: `Title-ID (16 Hex-Ziffern);Name`. Spätere Zeilen gelten
 vor früheren (ein Name kann sich ändern). Fehlt eine Title-ID, zeigt man die Nummer.
+
+## `pld.dat` (Aktivitätslog-App)
+
+Der Spielstand der Aktivitätslog-App (System-Spielstand `0002xxyy`, bei der europäischen
+Version `00020222`), unverändert kopiert. Er reicht zurück bis zur ersten Benutzung der
+Konsole – weiter als der Spielzeit-Log, der nach etwa 73.000 Einträgen überschreibt. Aus
+ihm zeichnet die App ihre Grafiken und die Software-Bibliothek. Little Endian, 806.160 Bytes:
+
+| Offset | Größe | Inhalt |
+|---|---|---|
+| 0x0 | 16 | Kopf (u32 0, u32 unbekannt, u32 2, u32 0) |
+| 0x10 | 50.000 × 16 | **Spielzeit pro Stunde und Titel**, ältester zuerst |
+| 0xC3510 | 256 × 24 | **Software-Bibliothek**: Summe pro Titel |
+
+Stunden-Eintrag (16 Bytes): u64 Title-ID, u32 Beginn der Stunde in Sekunden seit
+1.1.2000 (Ortszeit wie am 3DS), u32 in dieser Stunde gespielte Sekunden. Unbenutzte Plätze
+sind `FF…`. Die Summen pro Tag/Monat/Jahr der App sind die Summen dieser Werte. Was die
+App ab 50.000 belegten Stunden macht, ist nicht bekannt – deshalb `pld-erste.dat`.
+
+Bibliotheks-Eintrag (24 Bytes): u64 Title-ID, u32 Gesamtspielzeit in Sekunden, u16 Anzahl
+Starts, u16 unbekannt (bisher immer 2), u16 zuerst gespielt, u16 zuletzt gespielt (beide
+Tage seit 1.1.2000), u32 unbekannt (bisher 0). Höchstens 256 Titel; ist sie voll, entfernt
+die App einen (laut Handbuch den mit der kürzesten Spielzeit). Der Spielzeit-Log und
+damit `playhistory.bin` haben keine solche Grenze.
+
+Geprüft an einem echten Gerät: Pokémon Mond – 263:41, 531-mal, 28.01.2017 bis 17.02.2018,
+genau wie in der App angezeigt.
+
+## `Pedometer.dat`
+
+Unverändert aus dem System-Spielstand von PTM (`00010022`). Format noch nicht ausgewertet
+(laut 3dbrew Einträge aus Zeitstempel und Schrittzahl).
 
 ## Wie das Archiv wächst
 

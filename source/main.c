@@ -4563,6 +4563,95 @@ static void archiveTitles(void)
     }
 }
 
+/* a file from a system save (only read): the Activity Log app's own data (pld.dat: play time
+   per title and hour since the 3DS was first used, and the per-title totals of its software
+   library) and the step counter (Pedometer.dat in PTM's save). */
+static Result sysSaveRead(u32 saveId, const char* name, u8** out, u32* size)
+{
+    u32 low[2] = { MEDIATYPE_NAND, saveId };
+    FS_Archive a;
+    Result r = FSUSER_OpenArchive(&a, ARCHIVE_SYSTEM_SAVEDATA, (FS_Path){ PATH_BINARY, sizeof(low), low });
+    if (R_FAILED(r)) return r;
+    Handle f;
+    r = FSUSER_OpenFile(&f, a, fsMakePath(PATH_ASCII, name), FS_OPEN_READ, 0);
+    if (R_SUCCEEDED(r))
+    {
+        u64 sz = 0;
+        r = FSFILE_GetSize(f, &sz);
+        if (R_SUCCEEDED(r) && (sz == 0 || sz > 8 * 1024 * 1024)) r = (Result)0xE0000001;
+        u8* buf = R_SUCCEEDED(r) ? (u8*)malloc((size_t)sz) : NULL;
+        if (R_SUCCEEDED(r) && !buf) r = (Result)0xE0000002;
+        u32 got = 0;
+        if (R_SUCCEEDED(r)) r = FSFILE_Read(f, &got, 0, buf, (u32)sz);
+        if (R_SUCCEEDED(r) && got != sz) r = (Result)0xE0000003;
+        FSFILE_Close(f);
+        if (R_SUCCEEDED(r)) { *out = buf; *size = (u32)sz; }
+        else free(buf);
+    }
+    FSUSER_CloseArchive(a);
+    return r;
+}
+
+/* writes a file only if it is new or different (new file, then renamed over the old one) */
+static bool writeIfChanged(const char* path, const u8* data, u32 size)
+{
+    FILE* f = fopen(path, "rb");
+    if (f)
+    {
+        bool same = true;
+        static u8 buf[16384];
+        u32 pos = 0;
+        size_t n;
+        while (same && (n = fread(buf, 1, sizeof(buf), f)) > 0)
+        {
+            same = pos + n <= size && memcmp(buf, data + pos, n) == 0;
+            pos += (u32)n;
+        }
+        fclose(f);
+        if (same && pos == size) return false;
+    }
+    char tmp[128];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    f = fopen(tmp, "wb");
+    if (!f) return false;
+    bool ok = fwrite(data, 1, size, f) == size;
+    if (fclose(f) != 0) ok = false;
+    if (ok) { remove(path); rename(tmp, path); }
+    else remove(tmp);
+    return ok;
+}
+
+/* <name>.dat (newest) and <name>-erste.dat (the first one ever taken, never replaced) */
+static void archiveSysFile(const u32* saves, int nsaves, const char* file, const char* base)
+{
+    u8* data = NULL;
+    u32 size = 0;
+    Result r = -1;
+    int i;
+    for (i = 0; i < nsaves && R_FAILED(r); i++) r = sysSaveRead(saves[i], file, &data, &size);
+    if (R_FAILED(r)) { playCheckLog("%s: not readable (%08lX)\n", file, (unsigned long)r); return; }
+    char path[128];
+    snprintf(path, sizeof(path), ARC_DIR "/%s-erste.dat", base);
+    FILE* f = fopen(path, "rb");
+    if (f) fclose(f);
+    else writeIfChanged(path, data, size);
+    snprintf(path, sizeof(path), ARC_DIR "/%s.dat", base);
+    bool changed = writeIfChanged(path, data, size);
+    playCheckLog("%s (save %08lX): %lu bytes, %s\n", file, (unsigned long)saves[i - 1], (unsigned long)size,
+                 changed ? "saved" : "unchanged");
+    free(data);
+}
+
+static void archiveSysFiles(void)
+{
+    /* the Activity Log app's save: 0002xxyy from its title 000400100002xx00 (EUR, USA,
+       JPN, CHN, KOR, TWN) */
+    static const u32 pld[6] = { 0x00020222, 0x00020212, 0x00020202, 0x00020262, 0x00020272, 0x00020282 };
+    static const u32 ptm[1] = { 0x00010022 };
+    archiveSysFile(pld, 6, "/pld.dat", "pld");
+    archiveSysFile(ptm, 1, "/Pedometer.dat", "Pedometer");
+}
+
 /* the archive is brought up to date beside the app (it can take a few seconds the first
    time): the screen stays usable, a line says what is going on */
 static Thread g_arcThread;
@@ -4573,6 +4662,7 @@ static void archiveThread(void* arg)
     u64 t0 = osGetTime();
     int added = archiveSync();
     u64 t1 = osGetTime();
+    archiveSysFiles();
     archiveTitles();
     playCheckLog("archive: %d new entries, now %lld, %lu ms; titles %lu ms\n", added, (long long)g_arcCount,
                  (unsigned long)(t1 - t0), (unsigned long)(osGetTime() - t1));
