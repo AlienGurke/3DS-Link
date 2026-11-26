@@ -1,5 +1,5 @@
 /*
-    melonDS Link - 3DS side
+    3DS Link (formerly melonDS Link) - 3DS side
 
     Turns the 3DS into a controller (buttons + touch) for melonDS on the PC,
     shows the DS bottom screen streamed from the PC, and gives melonDS
@@ -123,11 +123,11 @@ enum StrId
 
 static const char* const g_strs[LANG_COUNT][S_COUNT] = {
     {   /* English */
-        "melonDS Link", "IP address:", "connected", "waiting...", "Controls:", "active", "Picture:",
+        "3DS Link", "IP address:", "connected", "waiting...", "Controls:", "active", "Picture:",
         "Display:", "Enlarged", "Original (1:1)", "Pick a game", "No .nds files found.",
         "A start  X fav  Y reload  L/R tab", "A start  X fav  Y reload  L/R tab  B back", "Running:",
         "SELECT+START: menu   L+R+SELECT+START hold: quit", "C-stick: down = games, up = display",
-        "In melonDS: 3DS Link > Connect to 3DS", "melonDS Link menu", "Game list", "Display",
+        "In melonDS: 3DS Link > Connect to 3DS", "3DS Link menu", "Game list", "Display",
         "Turn top screen off", "Screenshot (saved on the PC)", "Language", "Back to the game", "Quit the app",
         "A select   B close", "Starting game - waiting for melonDS...", "Screenshot requested",
         "melonDS is not connected", "WiFi could not be started.", "Is WiFi on? START to quit.",
@@ -135,7 +135,7 @@ static const char* const g_strs[LANG_COUNT][S_COUNT] = {
         "Bottom screen picture", "on", "off (touch still works)", "End the game on the PC",
         "Still running in melonDS:", "Continue playing", "Game list",
         "Progress since the last in-game save will be lost.", "Start", "Back",
-        "End the game in melonDS?", "End the game", "Quit melonDS Link?",
+        "End the game in melonDS?", "End the game", "Quit 3DS Link?",
         "melonDS pauses the game until you connect again.", "A save is being written right now!",
         "Quit", "Ending the game...", "Start another game?",
         "Save backups", "Getting the list from the PC...", "No backups of this game on the PC.",
@@ -157,11 +157,11 @@ static const char* const g_strs[LANG_COUNT][S_COUNT] = {
         "The clock is already right",
     },
     {   /* Deutsch */
-        "melonDS Link", "IP-Adresse:", "verbunden", "wartet...", "Steuerung:", "aktiv", "Bild:",
+        "3DS Link", "IP-Adresse:", "verbunden", "wartet...", "Steuerung:", "aktiv", "Bild:",
         "Anzeige:", "Vergrößert", "Original (1:1)", "Spiel wählen", "Keine .nds-Dateien gefunden.",
         "A Start  X Favorit  Y neu  L/R Tab", "A Start  X Favorit  Y neu  L/R Tab  B zurück", "Läuft:",
         "SELECT+START: Menü   L+R+SELECT+START halten: Ende", "C-Stick: runter = Spiele, hoch = Anzeige",
-        "In melonDS: 3DS Link > Mit 3DS verbinden", "melonDS-Link-Menü", "Spieleliste", "Anzeige",
+        "In melonDS: 3DS Link > Mit 3DS verbinden", "3DS-Link-Menü", "Spieleliste", "Anzeige",
         "Oberen Bildschirm ausschalten", "Screenshot (wird am PC gespeichert)", "Sprache",
         "Zurück zum Spiel", "App beenden", "A auswählen   B schließen",
         "Starte Spiel - warte auf melonDS...", "Screenshot angefordert", "melonDS ist nicht verbunden",
@@ -170,7 +170,7 @@ static const char* const g_strs[LANG_COUNT][S_COUNT] = {
         "Bild unten", "an", "aus (Touch geht weiter)", "Spiel am PC beenden",
         "In melonDS läuft noch:", "Weiterspielen", "Spieleliste",
         "Fortschritt seit dem letzten Speichern im Spiel geht verloren.", "Starten", "Zurück",
-        "Spiel in melonDS beenden?", "Spiel beenden", "melonDS Link beenden?",
+        "Spiel in melonDS beenden?", "Spiel beenden", "3DS Link beenden?",
         "melonDS pausiert das Spiel, bis du wieder verbindest.", "Gerade wird ein Spielstand geschrieben!",
         "Beenden", "Spiel wird beendet...", "Ein anderes Spiel starten?",
         "Spielstand-Backups", "Hole die Liste vom PC...", "Keine Backups von diesem Spiel am PC.",
@@ -194,7 +194,7 @@ static const char* const g_strs[LANG_COUNT][S_COUNT] = {
 };
 static char g_tr[S_COUNT][80];   /* current language, already in code page 437 */
 
-/* the texts can be changed in sdmc:/3ds/melonDS-Link/Language/<code>.txt
+/* the texts can be changed in sdmc:/3ds/3DS-Link/Language/<code>.txt
    (key=text, UTF-8); the files are written with all keys when missing */
 static const char* const g_strKeys[S_COUNT] = {
     "title", "ip", "connected", "waiting", "controls", "active", "picture", "display",
@@ -228,12 +228,12 @@ static u32 langFileVersion(void)
     return h;
 }
 static char g_custom[LANG_COUNT][S_COUNT][80];   /* from the files ("" = built-in) */
-#define LANG_DIR "sdmc:/3ds/melonDS-Link/Language"
+#define LANG_DIR "sdmc:/3ds/3DS-Link/Language"
 
 static void loadLanguageFiles(void)
 {
     mkdir("sdmc:/3ds", 0777);
-    mkdir("sdmc:/3ds/melonDS-Link", 0777);
+    mkdir("sdmc:/3ds/3DS-Link", 0777);
     mkdir(LANG_DIR, 0777);
     for (int l = 0; l < LANG_COUNT; l++)
     {
@@ -272,7 +272,7 @@ static void loadLanguageFiles(void)
         /* new or incomplete (a newer app version): write all keys, keep the user's texts */
         f = fopen(path, "w");
         if (!f) continue;
-        fprintf(f, "# melonDS Link (3DS) - key=text, UTF-8. Restart the app after editing.\n");
+        fprintf(f, "# 3DS Link - key=text, UTF-8. Restart the app after editing.\n");
         fprintf(f, "version=%lx\n", (unsigned long)langFileVersion());
         for (int i = 0; i < S_COUNT; i++)
             fprintf(f, "%s=%s\n", g_strKeys[i], g_custom[l][i][0] ? g_custom[l][i] : g_strs[l][i]);
@@ -639,7 +639,7 @@ static char g_eventRom[LINK_MAX_PATH];
 static char g_eventSave[LINK_MAX_PATH];
 
 /* favourites: one file name per line in FAVS_PATH */
-#define FAVS_PATH "sdmc:/3ds/melonDS-Link-favoriten.txt"
+#define FAVS_PATH "sdmc:/3ds/3DS-Link-favoriten.txt"
 #define MAX_FAVS 128
 static char* g_favs[MAX_FAVS];
 static int g_favCount = 0;
@@ -2342,7 +2342,7 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload, int* ci
             LightLock_Unlock(&g_lock);
         }
         char tpath[LINK_MAX_PATH + 40];
-        snprintf(tpath, sizeof(tpath), "%s/melonDS-Link-sdtest.bin", dir);
+        snprintf(tpath, sizeof(tpath), "%s/3DS-Link-sdtest.bin", dir);
         const u32 N = 128 * 1024;
         u8* heap = (u8*)malloc(N);
         if (!heap) return sendResponse(fd, h, LINK_ERR_IO, NULL, 0);
@@ -3504,7 +3504,7 @@ static void inputThread(void* arg)
         hidScanInput();
         u32 held = hidKeysHeld();
 
-        /* SELECT + START: melonDS Link menu (on release).
+        /* SELECT + START: 3DS Link menu (on release).
            L + R + SELECT + START held ~1 s: quit - hard to do by accident */
         bool combo = (held & KEY_SELECT) && (held & KEY_START);
         bool quitCombo = combo && (held & KEY_L) && (held & KEY_R);
@@ -3801,7 +3801,23 @@ static void setLine(int row, const char* fmt, ...)
 /* ------------------------------------------------------------------ */
 /* settings on the SD card                                             */
 
-#define CONFIG_PATH "sdmc:/3ds/melonDS-Link.cfg"
+#define CONFIG_PATH "sdmc:/3ds/3DS-Link.cfg"
+
+/* the app was called "melonDS Link": its files on the SD card get the new name once
+   (renamed - nothing copied or deleted; already there under the new name: left alone) */
+static void moveOldFiles(void)
+{
+    static const char* const from[] = { "sdmc:/3ds/melonDS-Link.cfg", "sdmc:/3ds/melonDS-Link-favoriten.txt",
+                                         "sdmc:/3ds/melonDS-Link/Language" };
+    static const char* const to[] = { "sdmc:/3ds/3DS-Link.cfg", "sdmc:/3ds/3DS-Link-favoriten.txt",
+                                      "sdmc:/3ds/3DS-Link/Language" };
+    mkdir("sdmc:/3ds/3DS-Link", 0777);
+    for (int i = 0; i < 3; i++)
+    {
+        struct stat st;
+        if (stat(from[i], &st) == 0 && stat(to[i], &st) != 0) rename(from[i], to[i]);
+    }
+}
 
 /* Screen backlights. The gsp::Lcd service is opened only for the moment of
    switching: keeping a session open all the time left the HOME menu without
@@ -4120,6 +4136,7 @@ int main(int argc, char** argv)
     LightLock_Init(&g_acceptLock);
     static aptHookCookie hookCookie;
     aptHook(&hookCookie, aptHookFunc, NULL);
+    moveOldFiles();
     loadConfig();
     setVideoGeometry(g_client);
     loadLanguageFiles();
@@ -4423,7 +4440,7 @@ int main(int argc, char** argv)
         int localAsk = askActive ? LA_NONE : g_localAsk;
         if (g_menuToggle)
         {
-            /* SELECT + START tapped: open/close the melonDS Link menu */
+            /* SELECT + START tapped: open/close the 3DS Link menu */
             g_menuToggle = false;
             if (!askActive && localAsk == LA_NONE)
             {

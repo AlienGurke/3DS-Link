@@ -1,12 +1,12 @@
 #!/bin/sh
-# Builds melonDS-Link.cia from the .elf produced by `make`.
+# Builds 3DS-Link.cia from the .elf produced by `make`.
 # Needs makerom and bannertool; if they are not on PATH they are downloaded
 # from their GitHub releases (Linux x86_64).
 set -eu
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-ELF="${1:-$HERE/../melonDS-Link.elf}"
-OUT="${2:-$HERE/../melonDS-Link.cia}"
+ELF="${1:-$HERE/../3DS-Link.elf}"
+OUT="${2:-$HERE/../3DS-Link.cia}"
 TOOLS="$HERE/.tools"
 mkdir -p "$TOOLS"
 export PATH="$TOOLS:$PATH"
@@ -48,12 +48,12 @@ if ! command -v bannertool >/dev/null 2>&1; then
 fi
 
 bannertool makebanner -i "$HERE/banner.png" -a "$HERE/banner.wav" -o "$TOOLS/banner.bnr"
-bannertool makesmdh -s "melonDS Link" -l "3DS als Controller fuer melonDS" -p "AlienGurke" \
+bannertool makesmdh -s "3DS Link" -l "3DS als Controller fuer melonDS und Azahar" -p "AlienGurke" \
     -i "$HERE/icon.png" -o "$TOOLS/icon.icn"
 
 makerom -f cia -o "$OUT" -elf "$ELF" -rsf "$HERE/app.rsf" \
     -icon "$TOOLS/icon.icn" -banner "$TOOLS/banner.bnr" -target t -exefslogo \
-    -DAPP_TITLE="melonDS Link" \
+    -DAPP_TITLE="3DS Link" \
     -DAPP_PRODUCT_CODE="CTR-H-MDLK" \
     -DAPP_UNIQUE_ID=0xF4D5A \
     -DAPP_CATEGORY=Application \

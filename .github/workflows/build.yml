@@ -20,8 +20,8 @@ jobs:
       with:
         name: 3dsx-build
         path: |
-          melonDS-Link.3dsx
-          melonDS-Link.elf
+          3DS-Link.3dsx
+          3DS-Link.elf
 
   # makerom needs a newer glibc than the devkitPro container has
   cia:
@@ -43,10 +43,10 @@ jobs:
     - name: Build .cia (install with FBI for a Home Menu icon)
       env:
         GH_TOKEN: ${{ github.token }}
-      run: sh cia/build-cia.sh melonDS-Link.elf melonDS-Link.cia
+      run: sh cia/build-cia.sh 3DS-Link.elf 3DS-Link.cia
     - uses: actions/upload-artifact@v7
       with:
-        name: melonDS-Link-3ds
+        name: 3DS-Link
         path: |
-          melonDS-Link.cia
-          melonDS-Link.3dsx
+          3DS-Link.cia
+          3DS-Link.3dsx

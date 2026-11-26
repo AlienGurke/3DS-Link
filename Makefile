@@ -31,15 +31,15 @@ include $(DEVKITARM)/3ds_rules
 #     - icon.png
 #     - <libctru folder>/default_icon.png
 #---------------------------------------------------------------------------------
-TARGET		:=	melonDS-Link
+TARGET		:=	3DS-Link
 BUILD		:=	build
 SOURCES		:=	source lz4
 DATA		:=	data
 INCLUDES	:=	include lz4
 GRAPHICS	:=	gfx
 GFXBUILD	:=	$(BUILD)
-APP_TITLE	:=	melonDS Link
-APP_DESCRIPTION	:=	Steuere melonDS am PC mit deinem 3DS
+APP_TITLE	:=	3DS Link
+APP_DESCRIPTION	:=	Spiele in melonDS und Azahar am PC mit deinem 3DS
 APP_AUTHOR	:=	AlienGurke
 #ROMFS		:=	romfs
 #GFXBUILD	:=	$(ROMFS)/gfx
