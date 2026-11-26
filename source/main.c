@@ -4136,19 +4136,16 @@ static Result playHistoryWord(u32 header, s32* out)
     return r;
 }
 
-/* the newest `want` entries, oldest first; returns how many */
+/* the newest `want` entries, oldest first; returns how many. GetPlayHistory counts from the
+   oldest entry (the ring's start), not from the start of the file - so the newest n entries are
+   at offset length - n, and PTM itself goes round the end of the ring. */
 static int playHistoryLast(PlayEntry* out, int want)
 {
-    s32 start = 0, size = 0;
-    if (R_FAILED(playHistoryWord(IPC_MakeHeader(0x808, 0, 0), &start)) ||
-        R_FAILED(playHistoryWord(IPC_MakeHeader(0x809, 0, 0), &size)) || size <= 0)
+    s32 size = 0;
+    if (R_FAILED(playHistoryWord(IPC_MakeHeader(0x809, 0, 0), &size)) || size <= 0)
         return 0;
     int n = size < want ? size : want;
-    s32 first = (s32)(((s64)start + size - n) % PLAY_RING);
-    /* in two parts if it wraps around the end of the ring */
-    int part = first + n > PLAY_RING ? PLAY_RING - first : n;
-    if (R_FAILED(playHistoryRead(first, part, out))) return 0;
-    if (part < n && R_FAILED(playHistoryRead(0, n - part, out + part))) return part;
+    if (R_FAILED(playHistoryRead(size - n, n, out))) return 0;
     return n;
 }
 
