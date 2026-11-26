@@ -118,6 +118,7 @@ enum StrId
     S_M_CLOCK, S_C_NONE, S_C_INFO, S_C_DAY, S_C_DAYS, S_C_FWD, S_C_BACK, S_C_REAL, S_C_PEN1,
     S_C_PEN2, S_C_PENHINT, S_C_PC, S_C_SHIFT, S_C_HINT, S_C_SHIFTHINT, S_C_JUMPLINE, S_C_BLOCK,
     S_C_NOCHANGE,
+    S_M_PLAYLOG, S_PL_FAIL, S_PL_OK,
     S_COUNT
 };
 
@@ -155,6 +156,8 @@ static const char* const g_strs[LANG_COUNT][S_COUNT] = {
         "Clock from the PC", "Own shift: %+d h", "L+R+A: do it (the 3DS restarts)  B back",
         "A +1 h   Y -1 h   B back", "Time jump %s", "Time jump on: the PC cannot connect",
         "The clock is already right",
+        "Play time in the Activity Log", "Activity Log: check failed - switched off",
+        "Activity Log: entry checked",
     },
     {   /* Deutsch */
         "3DS Link", "IP-Adresse:", "verbunden", "wartet...", "Steuerung:", "aktiv", "Bild:",
@@ -190,6 +193,8 @@ static const char* const g_strs[LANG_COUNT][S_COUNT] = {
         "Uhr vom PC übernehmen", "Eigene Verschiebung: %+d h", "L+R+A: ausführen (3DS startet neu)  B zurück",
         "A +1 h   Y -1 h   B zurück", "Zeitsprung %s", "Zeitsprung aktiv: PC kann nicht verbinden",
         "Die Uhr stimmt schon",
+        "Spielzeit im Aktivitätslog", "Aktivitätslog: Prüfung fehlgeschlagen – aus",
+        "Aktivitätslog: Eintrag geprüft",
     },
 };
 static char g_tr[S_COUNT][80];   /* current language, already in code page 437 */
@@ -216,6 +221,7 @@ static const char* const g_strKeys[S_COUNT] = {
     "menu_clock", "clock_none", "clock_info", "clock_day", "clock_days", "clock_fwd", "clock_back",
     "clock_real", "clock_penalty1", "clock_penalty2", "clock_penalty_hint", "clock_pc", "clock_shift",
     "clock_hint", "clock_shift_hint", "clock_jump_line", "clock_block", "clock_nochange",
+    "menu_playlog", "playlog_fail", "playlog_ok",
 };
 /* the files carry a fingerprint of the built-in texts: when an app update
    changes a text, they are written anew (so the change shows up) */
@@ -510,7 +516,11 @@ static volatile s64 g_emuJump[2] = { 0, 0 };   /* the time jump of each emulator
 static volatile s64 g_pcLocalMs = 0;      /* the PC's local time (LinkOptionsExt) ... */
 static volatile u64 g_pcLocalAt = 0;      /* ... and our osGetTime when it came (0 = none) */
 static volatile bool g_jumpRefused = false;    /* a PC was turned away (time jump on) */
-static volatile bool g_clockOpen = false;   /* the clock screen (link menu > Clock) */
+static volatile bool g_clockOpen = false;
+/* play time in the Activity Log (setting, off by default): a game played on the PC is
+   noted as played on this 3DS (see playLogTick) */
+static bool g_playLog = false;
+static u64 g_playLogOpen = 0;             /* the game noted as started, not yet as ended */   /* the clock screen (link menu > Clock) */
 static volatile u32 g_sockGen = 0;               /* bumped after waking up: sockets are made anew */
 static volatile bool g_netPause = false;         /* the socket service is being restarted: hands off */
 static volatile bool g_wokeUp = false;           /* woke up, not yet connected to melonDS again */
@@ -3891,6 +3901,8 @@ static void loadConfig(void)
         else if (sscanf(line, "penaltystep=%d", &v) == 1) g_penaltyStep = v;
         else if (sscanf(line, "penaltydays=%d", &v) == 1) g_penaltyDays = v >= 1 && v <= 30 ? v : 3;
         else if (sscanf(line, "clockshift=%d", &v) == 1) g_clockShiftH = v >= -12 && v <= 14 ? v : 0;
+        else if (sscanf(line, "playlog=%d", &v) == 1) g_playLog = v != 0;
+        else if (sscanf(line, "playlogopen=%llx", &ll) == 1) g_playLogOpen = (u64)ll;
         else if (sscanf(line, "lang=%d", &v) == 1) g_lang = v;
         else if (sscanf(line, "client=%d", &v) == 1) g_client = v == (int)LINK_CLIENT_AZAHAR ? LINK_CLIENT_AZAHAR : LINK_CLIENT_MELONDS;
         else if (strncmp(line, "last=", 5) == 0)
@@ -3922,6 +3934,8 @@ static void saveConfig(void)
     fprintf(f, "penaltystep=%d\n", g_penaltyStep);
     fprintf(f, "penaltydays=%d\n", g_penaltyDays);
     fprintf(f, "clockshift=%d\n", g_clockShiftH);
+    fprintf(f, "playlog=%d\n", g_playLog ? 1 : 0);
+    fprintf(f, "playlogopen=%llx\n", (unsigned long long)g_playLogOpen);
     fprintf(f, "lang=%d\n", g_lang);
     fprintf(f, "client=%d\n", (int)g_client);
     fprintf(f, "romdir=%s\n", g_romDir);
@@ -4070,6 +4084,174 @@ static bool clockAction(int item)
     return true;
 }
 
+/* ------------------------------------------------------------------ */
+/* Activity Log. PTM keeps it (PlayHistory.dat, a ring of 12-byte entries: title id, then
+   4 bits event type and 28 bits minutes since 2000). Reading goes through ptm:plays;
+   adding goes through ptm:sysm NotifyPlayEvent (0x080E0140: type, program id, time) - the
+   way the system notes every start and end of a program. Its arguments are not documented:
+   the types are taken to be those of the stored entries, the time ms since 2000. So every
+   entry written is read back and checked; if it does not match, the setting turns off. */
+#define PLAY_RING 0x11D28
+typedef struct { u32 tidHigh, tidLow, info; } PlayEntry;
+
+static Result playHistoryRead(s32 start, s32 count, PlayEntry* out)
+{
+    Handle h;
+    Result r = srvGetServiceHandle(&h, "ptm:plays");
+    if (R_FAILED(r)) return r;
+    u32* cmd = getThreadCommandBuffer();
+    cmd[0] = IPC_MakeHeader(0x807, 2, 2);
+    cmd[1] = (u32)start;
+    cmd[2] = (u32)count;
+    cmd[3] = IPC_Desc_Buffer(sizeof(PlayEntry) * count, IPC_BUFFER_W);
+    cmd[4] = (u32)(uintptr_t)out;
+#ifdef LINK_HOST_TEST
+    shim_out_ptr = out;   /* (the PC simulation has 64-bit pointers) */
+#endif
+    r = svcSendSyncRequest(h);
+    if (R_SUCCEEDED(r)) r = (Result)cmd[1];
+    svcCloseHandle(h);
+    return r;
+}
+
+static Result playHistoryWord(u32 header, s32* out)
+{
+    Handle h;
+    Result r = srvGetServiceHandle(&h, "ptm:plays");
+    if (R_FAILED(r)) return r;
+    u32* cmd = getThreadCommandBuffer();
+    cmd[0] = header;
+    r = svcSendSyncRequest(h);
+    if (R_SUCCEEDED(r)) r = (Result)cmd[1];
+    if (R_SUCCEEDED(r)) *out = (s32)cmd[2];
+    svcCloseHandle(h);
+    return r;
+}
+
+/* the newest `want` entries, oldest first; returns how many */
+static int playHistoryLast(PlayEntry* out, int want)
+{
+    s32 start = 0, size = 0;
+    if (R_FAILED(playHistoryWord(IPC_MakeHeader(0x808, 0, 0), &start)) ||
+        R_FAILED(playHistoryWord(IPC_MakeHeader(0x809, 0, 0), &size)) || size <= 0)
+        return 0;
+    int n = size < want ? size : want;
+    s32 first = (s32)(((s64)start + size - n) % PLAY_RING);
+    /* in two parts if it wraps around the end of the ring */
+    int part = first + n > PLAY_RING ? PLAY_RING - first : n;
+    if (R_FAILED(playHistoryRead(first, part, out))) return 0;
+    if (part < n && R_FAILED(playHistoryRead(0, n - part, out + part))) return part;
+    return n;
+}
+
+static u32 nowMinutes2000(void) { return (u32)((osGetTime() - 3155673600000ULL) / 60000); }
+
+/* the newest entries as text: sdmc:/3ds/3DS-Link/activity-log.txt (only read, for checking) */
+static void playHistoryDump(const char* why)
+{
+    static PlayEntry e[200];
+    int n = playHistoryLast(e, 200);
+    FILE* f = fopen("sdmc:/3ds/3DS-Link/activity-log.txt", "w");
+    if (!f) return;
+    fprintf(f, "# Activity Log, newest %d entries (%s); now %lu minutes since 2000\n# title id, type, minutes, date\n",
+            n, why, (unsigned long)nowMinutes2000());
+    for (int i = 0; i < n; i++)
+    {
+        u32 m = e[i].info >> 4;
+        s64 days = (s64)(m / 1440) + daysSince1900(2000, 1, 1);
+        int y, mo, d;
+        dateFromDays1900(days, &y, &mo, &d);
+        fprintf(f, "%08lX%08lX %2lu %8lu %04d-%02d-%02d %02lu:%02lu\n", (unsigned long)e[i].tidHigh,
+                (unsigned long)e[i].tidLow, (unsigned long)(e[i].info & 15), (unsigned long)m, y, mo, d,
+                (unsigned long)(m % 1440 / 60), (unsigned long)(m % 60));
+    }
+    fclose(f);
+}
+
+static Result playNotify(u32 type, u64 tid, u64 msSince2000)
+{
+    Handle h;
+    Result r = srvGetServiceHandle(&h, "ptm:sysm");
+    if (R_FAILED(r)) return r;
+    u32* cmd = getThreadCommandBuffer();
+    cmd[0] = IPC_MakeHeader(0x80E, 5, 0);   /* NotifyPlayEvent */
+    cmd[1] = type;
+    cmd[2] = (u32)tid;
+    cmd[3] = (u32)(tid >> 32);
+    cmd[4] = (u32)msSince2000;
+    cmd[5] = (u32)(msSince2000 >> 32);
+    r = svcSendSyncRequest(h);
+    if (R_SUCCEEDED(r)) r = (Result)cmd[1];
+    svcCloseHandle(h);
+    return r;
+}
+
+/* type 0 launch, 1 end, 4 back into a program, 5 out of a program (as stored) */
+#define PLAY_LAUNCH 0u
+#define PLAY_EXIT 1u
+#define PLAY_JUMP_TO 4u
+#define PLAY_LEAVE 5u
+
+/* one entry, read back: is the newest entry this one, at this minute? */
+static bool playNote(u32 type, u64 tid)
+{
+    u32 want = nowMinutes2000();
+    if (R_FAILED(playNotify(type, tid, osGetTime() - 3155673600000ULL))) return false;
+    PlayEntry e[4];
+    int n = playHistoryLast(e, 4);
+    for (int i = n - 1; i >= 0; i--)
+    {
+        u64 t = ((u64)e[i].tidHigh << 32) | e[i].tidLow;
+        if (t == tid && (e[i].info & 15) == type)
+        {
+            u32 m = e[i].info >> 4;
+            return m + 1 >= want && m <= want + 1;
+        }
+    }
+    return false;
+}
+
+static u64 ownProgramId(void)
+{
+    u64 id = 0;
+    APT_GetProgramID(&id);
+    return id;
+}
+
+/* called by the main loop: a 3DS game played in Azahar is noted as started on this 3DS (and
+   this app as left), and as ended when it ends (this app back) - the Activity Log counts it */
+static void playLogTick(bool on, u64 gameTid)
+{
+    u64 want = on ? gameTid : 0;
+    if (want == g_playLogOpen) return;
+    u64 self = ownProgramId();
+    bool ok = true;
+    if (g_playLogOpen)
+    {
+        ok = playNote(PLAY_EXIT, g_playLogOpen);
+        if (self) playNote(PLAY_JUMP_TO, self);
+        g_playLogOpen = 0;
+    }
+    if (want && ok)
+    {
+        if (self) playNote(PLAY_LEAVE, self);
+        ok = playNote(PLAY_LAUNCH, want);
+        if (ok) g_playLogOpen = want;
+        else
+        {
+            /* not as expected: close it again if it landed somehow, stop for good */
+            playNotify(PLAY_EXIT, want, osGetTime() - 3155673600000ULL);
+            if (self) playNotify(PLAY_JUMP_TO, self, osGetTime() - 3155673600000ULL);
+        }
+    }
+    if (!ok) g_playLog = false;
+    LightLock_Lock(&g_lock);
+    snprintf(g_statusText, sizeof(g_statusText), "%s", T(ok ? S_PL_OK : S_PL_FAIL));
+    LightLock_Unlock(&g_lock);
+    saveConfig();
+    playHistoryDump(ok ? "after a note" : "a note did not match");
+}
+
 /* battery, charging, WiFi and the lid. The services are only opened for the
    moment of asking (see lcdBacklight). */
 static void readConsoleState(bool battery)
@@ -4141,6 +4323,10 @@ int main(int argc, char** argv)
     setVideoGeometry(g_client);
     loadLanguageFiles();
     applyLanguage();
+    /* the Activity Log: what it holds (only read, for checking), and a game noted as started
+       before the app ended unexpectedly gets its end now */
+    playHistoryDump("app start");
+    if (g_playLogOpen) playLogTick(false, 0);
     loadFavs();
     scanGames();
 
@@ -4397,6 +4583,23 @@ int main(int argc, char** argv)
             redrawBoth--;
         }
 
+        /* the Activity Log (setting): the 3DS game that runs in Azahar counts as played here */
+        {
+            static u64 lastCheck = 0;
+            u64 tnow = osGetTime();
+            if (tnow - lastCheck >= 1000 || (!g_playLog && g_playLogOpen))
+            {
+                lastCheck = tnow;
+                u64 tid = 0;
+                LightLock_Lock(&g_lock);
+                if (g_playLog && g_client == LINK_CLIENT_AZAHAR && g_connected[1] && g_gameStarted && !g_launchPending)
+                    for (int i = 0; i < g_libCount; i++)
+                        if (g_lib[i].tid && strcmp(g_lib[i].name, g_currentGame) == 0) { tid = g_lib[i].tid; break; }
+                LightLock_Unlock(&g_lock);
+                playLogTick(tid != 0, tid);
+            }
+        }
+
         /* ---------------- user interface ---------------- */
         u32 mk;
         LightLock_Lock(&g_lock);
@@ -4524,8 +4727,8 @@ int main(int argc, char** argv)
         setBottomBacklight(!g_videoOff && !lidDark);
 
         /* the menu: only what makes sense right now */
-        enum { MI_BACK, MI_GAMES, MI_SHOT, MI_SHOTMODE, MI_BACKUPS, MI_DISPLAY, MI_BOTTOM, MI_TOPOFF, MI_STATUSBAR, MI_GLITCH, MI_PACE, MI_CLOCK, MI_LANG, MI_STOP, MI_QUIT };
-        int items[15], itemCount = 0;
+        enum { MI_BACK, MI_GAMES, MI_SHOT, MI_SHOTMODE, MI_BACKUPS, MI_DISPLAY, MI_BOTTOM, MI_TOPOFF, MI_STATUSBAR, MI_GLITCH, MI_PACE, MI_CLOCK, MI_PLAYLOG, MI_LANG, MI_STOP, MI_QUIT };
+        int items[16], itemCount = 0;
         bool playing = g_gameStarted && !g_launchPending;
         if (g_gameStarted) items[itemCount++] = MI_BACK;
         items[itemCount++] = MI_GAMES;
@@ -4556,6 +4759,7 @@ int main(int argc, char** argv)
         if (g_mvdReady && g_client == LINK_CLIENT_AZAHAR) items[itemCount++] = MI_GLITCH;
         if (!g_videoOff) items[itemCount++] = MI_PACE;
         if (!g_gameStarted) items[itemCount++] = MI_CLOCK;   /* restarts the 3DS: not while playing */
+        items[itemCount++] = MI_PLAYLOG;
         items[itemCount++] = MI_LANG;
         if (playing && g_tcpConnected) items[itemCount++] = MI_STOP;
         items[itemCount++] = MI_QUIT;
@@ -4678,6 +4882,7 @@ int main(int argc, char** argv)
                     break;
                 case MI_STOP: g_localAsk = LA_STOP; break;
                 case MI_CLOCK: g_linkMenuOpen = false; g_clockOpen = true; clockCursor = 0; break;
+                case MI_PLAYLOG: g_playLog = !g_playLog; saveConfig(); break;
                 case MI_BACKUPS:
                     LightLock_Lock(&g_lock);
                     if (bakLib >= 0) snprintf(g_bakRom, sizeof(g_bakRom), "%s", g_lib[bakLib].path);
@@ -5011,6 +5216,7 @@ int main(int argc, char** argv)
                 case MI_LANG: snprintf(label, sizeof(label), "%s: %s", T(S_M_LANG), T(S_LANGNAME)); break;
                 case MI_STOP: snprintf(label, sizeof(label), "%s", T(S_M_STOP)); break;
                 case MI_CLOCK: snprintf(label, sizeof(label), "%s", T(S_M_CLOCK)); break;
+                case MI_PLAYLOG: snprintf(label, sizeof(label), "%s: %s", T(S_M_PLAYLOG), g_playLog ? T(S_ON) : T(S_OFF)); break;
                 case MI_BACKUPS:
                 {
                     char nm[300];
@@ -5165,6 +5371,7 @@ int main(int argc, char** argv)
         g_vblankTickMs = tickMs();
     }
 
+    if (g_playLogOpen) playLogTick(false, 0);   /* the game counts as ended with the app */
     g_running = false;
     close(g_listenFd);
     threadJoin(inp, U64_MAX);
