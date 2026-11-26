@@ -4200,13 +4200,42 @@ static Result playNotify(u32 type, u64 tid, u64 msSince2000)
 #define PLAY_JUMP_TO 4u
 #define PLAY_LEAVE 5u
 
-/* one entry, read back: is the newest entry this one, at this minute? */
-static bool playNote(u32 type, u64 tid)
+/* what each check saw, for finding out why one failed: sdmc:/3ds/3DS-Link/activity-check.txt */
+static void playCheckLog(const char* fmt, ...)
+{
+    FILE* f = fopen("sdmc:/3ds/3DS-Link/activity-check.txt", "a");
+    if (!f) return;
+    va_list a;
+    va_start(a, fmt);
+    vfprintf(f, fmt, a);
+    va_end(a);
+    fclose(f);
+}
+
+static s32 playHistorySize(void)
+{
+    s32 size = -1;
+    if (R_FAILED(playHistoryWord(IPC_MakeHeader(0x809, 0, 0), &size))) return -1;
+    return size;
+}
+
+/* one entry, read back: is the newest entry this one, at this minute? *landed: did the log grow */
+static bool playNote(u32 type, u64 tid, bool* landed)
 {
     u32 want = nowMinutes2000();
-    if (R_FAILED(playNotify(type, tid, osGetTime() - 3155673600000ULL))) return false;
+    s32 before = playHistorySize();
+    Result r = playNotify(type, tid, osGetTime() - 3155673600000ULL);
+    s32 after = playHistorySize();
+    if (landed) *landed = after != before;
+    playCheckLog("note type %lu tid %016llX at minute %lu: result %08lX, size %ld -> %ld\n",
+                 (unsigned long)type, (unsigned long long)tid, (unsigned long)want, (unsigned long)r,
+                 (long)before, (long)after);
+    if (R_FAILED(r)) return false;
     PlayEntry e[4];
     int n = playHistoryLast(e, 4);
+    for (int i = 0; i < n; i++)
+        playCheckLog("  read %08lX%08lX type %lu minute %lu\n", (unsigned long)e[i].tidHigh,
+                     (unsigned long)e[i].tidLow, (unsigned long)(e[i].info & 15), (unsigned long)(e[i].info >> 4));
     for (int i = n - 1; i >= 0; i--)
     {
         u64 t = ((u64)e[i].tidHigh << 32) | e[i].tidLow;
@@ -4236,19 +4265,20 @@ static void playLogTick(bool on, u64 gameTid)
     bool ok = true;
     if (g_playLogOpen)
     {
-        ok = playNote(PLAY_EXIT, g_playLogOpen);
-        if (self) playNote(PLAY_JUMP_TO, self);
+        ok = playNote(PLAY_EXIT, g_playLogOpen, NULL);
+        if (self) playNote(PLAY_JUMP_TO, self, NULL);
         g_playLogOpen = 0;
     }
     if (want && ok)
     {
-        if (self) playNote(PLAY_LEAVE, self);
-        ok = playNote(PLAY_LAUNCH, want);
+        bool landed = false;
+        if (self) playNote(PLAY_LEAVE, self, NULL);
+        ok = playNote(PLAY_LAUNCH, want, &landed);
         if (ok) g_playLogOpen = want;
         else
         {
-            /* not as expected: close it again if it landed somehow, stop for good */
-            playNotify(PLAY_EXIT, want, osGetTime() - 3155673600000ULL);
+            /* not as expected: only if something landed, close it again; stop for good */
+            if (landed) playNotify(PLAY_EXIT, want, osGetTime() - 3155673600000ULL);
             if (self) playNotify(PLAY_JUMP_TO, self, osGetTime() - 3155673600000ULL);
         }
     }
