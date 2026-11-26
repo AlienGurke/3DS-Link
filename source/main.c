@@ -4182,6 +4182,19 @@ int main(int argc, char** argv)
                 shownNo = pickNo;
                 newPicture = true;
                 if (!g_rotMode) memcpy(g_dsImage, g_rotImage[pick], sizeof(g_dsImage));   /* tiles */
+                else if (g_vidW != 320)
+                {
+                    /* H.264 from melonDS: the DS picture sits in the middle of the coded
+                       3DS screen (turned like the framebuffer) - out into the DS image, so
+                       the zoom and the frame work as with tiles */
+                    const u16* rot = g_rotImage[pick];
+                    for (int x = 0; x < 256; x++)
+                    {
+                        const u16* col = rot + (x + LINK_DS_OFFSET_X) * 240 + (239 - LINK_DS_OFFSET_Y);
+                        u16* dst = g_dsImage + x;
+                        for (int y = 0; y < 192; y++) dst[y * 256] = col[-y];
+                    }
+                }
             }
         }
 
