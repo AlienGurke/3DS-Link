@@ -12,9 +12,11 @@ liest**. Sie reicht, um ein eigenes Dashboard oder Werkzeug dafür zu bauen.
 
 | Datei | Inhalt | wird geschrieben von |
 |---|---|---|
-| `playhistory.bin` | die Einträge vom 3DS, ältester zuerst, nur angehängt | 3DS Link (bei jedem Start, geplant), Werkzeuge in `tools/activity-log/` |
+| `playhistory.bin` | die Einträge vom 3DS, unverändert, ältester zuerst, nur angehängt | 3DS Link (bei jedem Start), Werkzeuge in `tools/activity-log/` |
+| `playhistory-copy.bin` | Kopie davon (zweite Sicherung auf der SD-Karte) | 3DS Link |
+| `clock.txt` | Zeitsprünge und Uhr-Korrekturen, mit Eintrags-Nummer | 3DS Link (Uhr-Menü) |
+| `titles.txt` | Title-ID → Spielname | 3DS Link (bei jedem Start, nur neue) |
 | `playhistory-pc.bin` | gespielt am PC ohne 3DS (Azahar), gleiches Format | Azahar Link (geplant) |
-| `titles.txt` | Title-ID → Spielname | 3DS Link (geplant) |
 
 Auf der SD-Karte liegen sie in `sdmc:/3ds/3DS-Link/activity/`.
 
@@ -90,24 +92,51 @@ Für jede Title-ID der Reihe nach:
 
 ### Zeitsprünge
 
-Wurde die Uhr verstellt (auch durch die Uhr-Funktionen von 3DS Link), stehen Einträge mit
-späteren oder früheren Zeiten mitten im Archiv. Die Reihenfolge im Archiv ist immer die
-echte Reihenfolge; nur die Uhrzeiten springen. Ein Dashboard sollte deshalb:
+Die Reihenfolge im Archiv ist immer die echte Reihenfolge; nur die Uhrzeiten springen, wenn
+die Uhr verstellt war. Zeitsprünge über 3DS Link stehen in `clock.txt` und werden beim
+Auswerten herausgerechnet (siehe dort). Für alles andere (Uhr in den Systemeinstellungen
+oder mit anderen Tools verstellt) sollte ein Dashboard:
 
 - eine Sitzung verwerfen, deren Ende vor ihrem Beginn liegt oder die unplausibel lang ist,
 - Sitzungen nach ihrer Startzeit dem Tag zuordnen (so macht es auch der 3DS).
+
+## `clock.txt`
+
+Text, eine Zeile pro Ereignis, nur angehängt. *n* ist eine Eintrags-Nummer in
+`playhistory.bin` (0 = erster Eintrag): das Ereignis gilt **ab Eintrag n**. Minuten mit
+Vorzeichen.
+
+| Zeile | Bedeutung | Auswertung |
+|---|---|---|
+| `sprung n ±m` | Zeitsprung über 3DS Link: ab Eintrag *n* geht die Uhr um *m* Minuten falsch (+1440 = einen Tag vor) | bei Einträgen ab *n* die *m* Minuten **abziehen** |
+| `ende n` | ab Eintrag *n* kein Zeitsprung mehr | ab *n* nichts mehr abziehen |
+| `gestellt n alt neu` | Uhr gestellt („Uhr vom PC übernehmen“): eine Korrektur, die Uhr stimmt danach. *alt*, *neu*: Minuten seit 2000 | **nichts** herausrechnen, nur zur Info |
+| `unsicher sprung ±m` / `unsicher gestellt ±m` | wie oben, aber das Archiv war in dem Moment nicht lesbar: die Stelle ist unbekannt | nicht automatisch korrigieren, anzeigen |
+
+Ein Wechsel von +1 auf +2 Tage steht als `ende n` und `sprung n +2880` da. Die Grenze ist
+exakt: 3DS Link bringt das Archiv auf den neuesten Stand, unmittelbar bevor es die Uhr
+umstellt und den 3DS neu startet.
+
+Nicht in `clock.txt`: Uhr in den Systemeinstellungen umgestellt (das trägt der 3DS selbst
+als Ereignis 11/12 ein; es ist eine Korrektur und wird nicht herausgerechnet – ein laufender
+Zeitsprung von 3DS Link bleibt dabei bestehen, denn er sitzt in der Hardware-Uhr). Uhr mit
+anderen Tools (z. B. RTChanger) verstellt: nicht erkennbar.
 
 ## `titles.txt`
 
 Text, UTF-8, eine Zeile pro Spiel: `Title-ID (16 Hex-Ziffern);Name`. Spätere Zeilen gelten
 vor früheren (ein Name kann sich ändern). Fehlt eine Title-ID, zeigt man die Nummer.
 
-## Wie das Archiv wächst (3DS Link, geplant)
+## Wie das Archiv wächst
 
-- **3DS Link** fragt bei jedem Start die neuesten Einträge des 3DS ab, sucht darin die
-  letzten 32 Einträge des Archivs und hängt alles danach an. Findet es sie nicht (die App
-  war jahrelang nicht offen), hängt es eine Lücke und dann alle Einträge an.
-- Die Datei wird **nur verlängert, nie umgeschrieben**.
+- **3DS Link** liest bei jedem Start den Aktivitätslog des 3DS (nur lesend), sucht darin
+  die letzten 32 Einträge des Archivs und hängt alles danach an. Findet es sie nicht (die
+  App war jahrelang nicht offen), hängt es eine Lücke und dann alle Einträge an.
+- Die Datei wird **nur verlängert, nie umgeschrieben**. Ein beim Schreiben abgeschnittener
+  letzter Eintrag wird beim nächsten Mal überschrieben. Doppelte Einträge kann es nicht
+  geben: angehängt wird nur, was nach dem Archiv-Ende kommt.
+- Danach wird `playhistory-copy.bin` erneuert (über eine Zwischendatei, also nie halb).
+- Ist `playhistory.bin` vorhanden, aber kein Archiv (falscher Kopf), fasst 3DS Link es nicht an.
 
 ## Alte Backups dazunehmen (Merge)
 

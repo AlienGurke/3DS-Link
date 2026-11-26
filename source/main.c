@@ -119,6 +119,7 @@ enum StrId
     S_C_PEN2, S_C_PENHINT, S_C_PC, S_C_SHIFT, S_C_HINT, S_C_SHIFTHINT, S_C_JUMPLINE, S_C_BLOCK,
     S_C_NOCHANGE,
     S_M_PLAYLOG, S_PL_FAIL, S_PL_OK,
+    S_ARC_OK, S_ARC_FAIL, S_C_HJUMP, S_C_HSET,
     S_COUNT
 };
 
@@ -158,6 +159,8 @@ static const char* const g_strs[LANG_COUNT][S_COUNT] = {
         "The clock is already right",
         "Play time in the Activity Log", "Activity Log: check failed - switched off",
         "Activity Log: entry checked",
+        "Activity Log: %d new entries archived", "Activity Log archive: could not be written",
+        "Time jump (games; left out of stats)", "Set the clock (correction)",
     },
     {   /* Deutsch */
         "3DS Link", "IP-Adresse:", "verbunden", "wartet...", "Steuerung:", "aktiv", "Bild:",
@@ -195,6 +198,8 @@ static const char* const g_strs[LANG_COUNT][S_COUNT] = {
         "Die Uhr stimmt schon",
         "Spielzeit im Aktivitätslog", "Aktivitätslog: Prüfung fehlgeschlagen – aus",
         "Aktivitätslog: Eintrag geprüft",
+        "Aktivitätslog: %d neue Einträge archiviert", "Aktivitätslog-Archiv: Schreiben fehlgeschlagen",
+        "Zeitsprung (für Spiele, aus Statistik raus)", "Uhr stellen (Korrektur)",
     },
 };
 static char g_tr[S_COUNT][80];   /* current language, already in code page 437 */
@@ -222,6 +227,7 @@ static const char* const g_strKeys[S_COUNT] = {
     "clock_real", "clock_penalty1", "clock_penalty2", "clock_penalty_hint", "clock_pc", "clock_shift",
     "clock_hint", "clock_shift_hint", "clock_jump_line", "clock_block", "clock_nochange",
     "menu_playlog", "playlog_fail", "playlog_ok",
+    "archive_ok", "archive_fail", "clock_head_jump", "clock_head_set",
 };
 /* the files carry a fingerprint of the built-in texts: when an app update
    changes a text, they are written anew (so the change shows up) */
@@ -4034,6 +4040,10 @@ static void jumpText(char* out, size_t n, s64 seconds)
     else snprintf(out, n, T(days == 1 || days == -1 ? S_C_DAY : S_C_DAYS), days);
 }
 
+static int archiveSync(void);
+static void archiveClockNote(const char* fmt, ...);
+static s64 g_arcCount;
+
 /* the clock menu */
 enum { CL_FWD, CL_BACK, CL_REAL, CL_PENALTY, CL_PC, CL_SHIFT };
 static int clockItems(int* items)
@@ -4076,7 +4086,25 @@ static bool clockAction(int item)
     }
     if (item != CL_PC) jump += move;
     if (move == 0) return false;
+    /* the archive first: what was noted so far has the clock as it was; from the next entry
+       on it is the new one. clock.txt says from which entry (see the doc). */
+    bool anchored = archiveSync() >= 0;
+    u64 before = osGetTime();
     if (!shiftRawRtc(move)) return false;
+    if (anchored)
+    {
+        if (item == CL_PC)
+            archiveClockNote("gestellt %lld %lu %lu", (long long)g_arcCount,
+                             (unsigned long)((before - 3155673600000ULL) / 60000),
+                             (unsigned long)((before + move * 1000 - 3155673600000ULL) / 60000));
+        else
+        {
+            if (g_ownJump != 0) archiveClockNote("ende %lld", (long long)g_arcCount);
+            if (jump != 0) archiveClockNote("sprung %lld %+lld", (long long)g_arcCount, (long long)(jump / 60));
+        }
+    }
+    else
+        archiveClockNote("unsicher %s %+lld", item == CL_PC ? "gestellt" : "sprung", (long long)(jump / 60));
     g_ownJump = jump;
     g_penaltyStep = step;
     saveConfig();
@@ -4282,6 +4310,215 @@ static void playLogTick(bool on, u64 gameTid)
     playHistoryDump(ok ? "after a note" : "a note did not match");
 }
 
+/* ------------------------------------------------------------------ */
+/* Activity Log archive (docs/activity-log-archive.md): the 3DS's entries copied, unchanged,
+   into a file that only grows - the 3DS overwrites its oldest ones once 73000 are full.
+   clock.txt notes the time jumps made here (an evaluation takes them out), titles.txt the
+   names of the titles. Only reading from the 3DS. */
+#define ARC_DIR "sdmc:/3ds/3DS-Link/activity"
+#define ARC_FILE ARC_DIR "/playhistory.bin"
+#define ARC_COPY ARC_DIR "/playhistory-copy.bin"
+#define ARC_CLOCK ARC_DIR "/clock.txt"
+#define ARC_TITLES ARC_DIR "/titles.txt"
+#define ARC_OVERLAP 32
+static const u8 ARC_MAGIC[8] = { '3', 'D', 'S', 'P', 'L', 'A', 'Y', 0 };
+static s64 g_arcCount = -1;   /* entries in the archive after the last sync, -1: unknown */
+
+/* a second copy next to it (new file, then renamed over the old copy) */
+static void archiveCopy(void)
+{
+    FILE* in = fopen(ARC_FILE, "rb");
+    if (!in) return;
+    FILE* out = fopen(ARC_COPY ".tmp", "wb");
+    bool ok = out != NULL;
+    static u8 buf[16384];
+    size_t n;
+    while (ok && (n = fread(buf, 1, sizeof(buf), in)) > 0) ok = fwrite(buf, 1, n, out) == n;
+    fclose(in);
+    if (out && fclose(out) != 0) ok = false;
+    if (ok)
+    {
+        remove(ARC_COPY);
+        rename(ARC_COPY ".tmp", ARC_COPY);
+    }
+    else remove(ARC_COPY ".tmp");
+}
+
+/* appends what the 3DS has that the archive has not yet: finds the archive's last 32
+   entries in the 3DS's log and takes everything after them. Not found (the 3DS overwrote
+   them already): a gap entry, then all. Returns how many were added, -1 on failure. */
+static int archiveSync(void)
+{
+    mkdir("sdmc:/3ds/3DS-Link", 0777);
+    mkdir(ARC_DIR, 0777);
+    s32 size = -1;
+    if (R_FAILED(playHistoryWord(IPC_MakeHeader(0x809, 0, 0), &size)) || size < 0 || size > PLAY_RING)
+        return -1;
+    PlayEntry* ring = (PlayEntry*)malloc(sizeof(PlayEntry) * (size ? size : 1));
+    if (!ring) return -1;
+    for (s32 o = 0; o < size;)
+    {
+        s32 n = size - o > 2048 ? 2048 : size - o;
+        if (R_FAILED(playHistoryRead(o, n, ring + o))) { free(ring); return -1; }
+        o += n;
+    }
+    s64 count = 0;
+    FILE* f = fopen(ARC_FILE, "r+b");
+    if (f)
+    {
+        u8 h[16];
+        if (fread(h, 1, 16, f) != 16 || memcmp(h, ARC_MAGIC, 8) != 0 || h[12] != 12)
+        {
+            fclose(f);   /* not an archive of ours: never touched */
+            free(ring);
+            return -1;
+        }
+        fseek(f, 0, SEEK_END);
+        count = (ftell(f) - 16) / 12;   /* a cut-off last entry does not count */
+    }
+    else
+    {
+        f = fopen(ARC_FILE, "w+b");
+        u32 head[2] = { 1, 12 };   /* version, entry size */
+        if (!f || fwrite(ARC_MAGIC, 1, 8, f) != 8 || fwrite(head, 4, 2, f) != 2)
+        {
+            if (f) fclose(f);
+            free(ring);
+            return -1;
+        }
+    }
+    int k = count < ARC_OVERLAP ? (int)count : ARC_OVERLAP;
+    PlayEntry tail[ARC_OVERLAP];
+    s32 from = 0;
+    bool gap = false;
+    if (k > 0)
+    {
+        fseek(f, 16 + (long)(count - k) * 12, SEEK_SET);
+        if (fread(tail, sizeof(PlayEntry), k, f) != (size_t)k) { fclose(f); free(ring); return -1; }
+        from = -1;
+        for (s32 p = size; p >= k; p--)   /* the newest place first */
+            if (memcmp(ring + p - k, tail, sizeof(PlayEntry) * k) == 0) { from = p; break; }
+        if (from < 0) { from = 0; gap = true; }
+    }
+    s32 add = size - from;
+    bool ok = true;
+    if (add > 0)
+    {
+        fseek(f, 16 + (long)count * 12, SEEK_SET);   /* over a cut-off entry, if any */
+        if (gap)
+        {
+            PlayEntry g = { 0xFFFFFFFF, 0xFFFFFFFE, (ring[0].info & ~15u) | 15 };
+            ok = fwrite(&g, sizeof(g), 1, f) == 1;
+            count++;
+        }
+        ok = ok && fwrite(ring + from, sizeof(PlayEntry), add, f) == (size_t)add;
+    }
+    if (fclose(f) != 0) ok = false;
+    free(ring);
+    if (!ok) return -1;
+    g_arcCount = count + add;
+    if (add > 0) archiveCopy();
+    return add;
+}
+
+/* a line in clock.txt: "<kind> <entry number> ..." (see the doc) */
+static void archiveClockNote(const char* fmt, ...)
+{
+    FILE* f = fopen(ARC_CLOCK, "a");
+    if (!f) return;
+    va_list a;
+    va_start(a, fmt);
+    vfprintf(f, fmt, a);
+    va_end(a);
+    fputc('\n', f);
+    fclose(f);
+}
+
+/* a title's name from its icon (SMDH), in the app's language, as UTF-8 */
+static bool titleName(u64 tid, FS_MediaType media, char* out, size_t n)
+{
+    u32 arch[4] = { (u32)tid, (u32)(tid >> 32), media, 0 };
+    static const u32 file[5] = { 0, 0, 2, 0x6E6F6369, 0 };   /* ExeFS "icon" */
+    FS_Path ap = { PATH_BINARY, sizeof(arch), arch };
+    FS_Path fp = { PATH_BINARY, sizeof(file), file };
+    Handle h;
+    if (R_FAILED(FSUSER_OpenFileDirectly(&h, ARCHIVE_SAVEDATA_AND_CONTENT, ap, fp, FS_OPEN_READ, 0)))
+        return false;
+    static u8 smdh[0x2008];
+    u32 got = 0;
+    Result r = FSFILE_Read(h, &got, 0, smdh, sizeof(smdh));
+    FSFILE_Close(h);
+    if (R_FAILED(r) || got < sizeof(smdh) || memcmp(smdh, "SMDH", 4) != 0) return false;
+    /* the app's language (German 3, English 1) first, then any other that has a name */
+    for (int l = -1; l < 12; l++)
+    {
+        const u8* s = smdh + 8 + (l < 0 ? (g_lang == LANG_DE ? 3 : 1) : l) * 0x200;   /* short name, 0x40 UTF-16 characters */
+        size_t o = 0;
+        for (int i = 0; i < 0x40; i++)
+        {
+            u32 c = s[i * 2] | (s[i * 2 + 1] << 8);
+            if (c == 0) break;
+            if (c == '\n' || c == '\r' || c == ';') c = ' ';
+            if (c < 0x80 && o + 1 < n) out[o++] = (char)c;
+            else if (c < 0x800 && o + 2 < n) { out[o++] = (char)(0xC0 | c >> 6); out[o++] = (char)(0x80 | (c & 63)); }
+            else if (c >= 0x800 && o + 3 < n)
+            {
+                out[o++] = (char)(0xE0 | c >> 12);
+                out[o++] = (char)(0x80 | (c >> 6 & 63));
+                out[o++] = (char)(0x80 | (c & 63));
+            }
+        }
+        out[o] = 0;
+        if (o > 0) return true;
+    }
+    return false;
+}
+
+/* titles.txt: "title id;name" for every installed title not in it yet */
+static void archiveTitles(void)
+{
+    static u64 known[2048];
+    int nk = 0;
+    FILE* f = fopen(ARC_TITLES, "r");
+    if (f)
+    {
+        char line[300];
+        while (nk < 2048 && fgets(line, sizeof(line), f))
+        {
+            char* end;
+            u64 t = strtoull(line, &end, 16);
+            if (end != line && *end == ';') known[nk++] = t;
+        }
+        fclose(f);
+    }
+    if (R_FAILED(amInit())) return;
+    f = fopen(ARC_TITLES, "a");
+    const FS_MediaType media[3] = { MEDIATYPE_NAND, MEDIATYPE_SD, MEDIATYPE_GAME_CARD };
+    static u64 ids[1024];
+    for (int m = 0; f && m < 3; m++)
+    {
+        u32 count = 0, read = 0;
+        if (R_FAILED(AM_GetTitleCount(media[m], &count))) continue;
+        if (count > 1024) count = 1024;
+        if (count && R_FAILED(AM_GetTitleList(&read, media[m], count, ids))) read = 0;
+        for (u32 j = 0; j < read; j++)
+        {
+            u32 high = (u32)(ids[j] >> 32);
+            /* what can show up in the Activity Log: games, demos, system programs, applets */
+            if (high != 0x00040000 && high != 0x00040002 && high != 0x00040010 && high != 0x00040030)
+                continue;
+            bool have = false;
+            for (int i = 0; i < nk && !have; i++) have = known[i] == ids[j];
+            char name[200];
+            if (have || !titleName(ids[j], media[m], name, sizeof(name))) continue;
+            fprintf(f, "%016llX;%s\n", (unsigned long long)ids[j], name);
+            if (nk < 2048) known[nk++] = ids[j];
+        }
+    }
+    if (f) fclose(f);
+    amExit();
+}
+
 /* battery, charging, WiFi and the lid. The services are only opened for the
    moment of asking (see lcdBacklight). */
 static void readConsoleState(bool battery)
@@ -4357,6 +4594,16 @@ int main(int argc, char** argv)
        before the app ended unexpectedly gets its end now */
     playHistoryDump("app start");
     if (g_playLogOpen) playLogTick(false, 0);
+    {
+        u64 t0 = osGetTime();
+        int added = archiveSync();
+        u64 t1 = osGetTime();
+        archiveTitles();
+        playCheckLog("archive: %d new entries, now %lld, %lu ms; titles %lu ms\n", added, (long long)g_arcCount,
+                     (unsigned long)(t1 - t0), (unsigned long)(osGetTime() - t1));
+        if (added > 0) snprintf(g_statusText, sizeof(g_statusText), T(S_ARC_OK), added);
+        else if (added < 0) snprintf(g_statusText, sizeof(g_statusText), "%s", T(S_ARC_FAIL));
+    }
     loadFavs();
     scanGames();
 
@@ -5274,14 +5521,16 @@ int main(int argc, char** argv)
             else { jumpText(jt, sizeof(jt), g_ownJump); snprintf(line, sizeof(line), T(S_C_INFO), jt); }
             setLine(10, "\x1b[36m%s\x1b[0m", T(S_M_CLOCK));
             setLine(11, "%s%.49s", g_ownJump ? "\x1b[35m" : "\x1b[90m", line);
-            setLine(12, "");
             int cl[8];
             int cn = clockItems(cl);
             if (clockCursor >= cn) clockCursor = cn - 1;
-            for (int r = 0; r < 12; r++)
+            /* two groups, kept apart: time jumps (taken out of the statistics) and setting
+               the clock (a correction) */
+            int row = 12;
+            for (int r = 0; r < cn && row < 25; r++)
             {
-                int row = 13 + r;
-                if (r >= cn) { setLine(row, ""); continue; }
+                if (cl[r] == CL_FWD || cl[r] == CL_PC)
+                    setLine(row++, "\x1b[36m%.49s", T(cl[r] == CL_FWD ? S_C_HJUMP : S_C_HSET));
                 char label[80];
                 switch (cl[r])
                 {
@@ -5296,9 +5545,10 @@ int main(int argc, char** argv)
                 case CL_SHIFT: snprintf(label, sizeof(label), T(S_C_SHIFT), g_clockShiftH); break;
                 default: label[0] = 0;
                 }
-                if (r == clockCursor) setLine(row, "\x1b[47;30m> %-46.46s", label);
-                else setLine(row, "  %-46.46s", label);
+                if (r == clockCursor) setLine(row++, "\x1b[47;30m> %-46.46s", label);
+                else setLine(row++, "  %-46.46s", label);
             }
+            while (row < 25) setLine(row++, "");
             setLine(25, g_penaltyStep ? "\x1b[33m%.49s" : "", T(S_C_PENHINT));
             setLine(26, "\x1b[90m%s", T(cl[clockCursor] == CL_SHIFT ? S_C_SHIFTHINT : S_C_HINT));
         }
