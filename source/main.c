@@ -4200,7 +4200,9 @@ static Result playNotify(u32 type, u64 tid, u64 msSince2000)
 /* what each check saw, for finding out why one failed: sdmc:/3ds/3DS-Link/activity-check.txt */
 static void playCheckLog(const char* fmt, ...)
 {
-    FILE* f = fopen("sdmc:/3ds/3DS-Link/activity-check.txt", "a");
+    static bool fresh = true;   /* a new file each time the app starts */
+    FILE* f = fopen("sdmc:/3ds/3DS-Link/activity-check.txt", fresh ? "w" : "a");
+    fresh = false;
     if (!f) return;
     va_list a;
     va_start(a, fmt);
@@ -4209,27 +4211,20 @@ static void playCheckLog(const char* fmt, ...)
     fclose(f);
 }
 
-static s32 playHistorySize(void)
-{
-    s32 size = -1;
-    if (R_FAILED(playHistoryWord(IPC_MakeHeader(0x809, 0, 0), &size))) return -1;
-    return size;
-}
-
 /* one entry, read back: is the newest entry this one, at this minute? *landed: did the log grow */
 static bool playNote(u32 type, u64 tid, bool* landed)
 {
     u32 want = nowMinutes2000();
-    s32 before = playHistorySize();
     Result r = playNotify(type, tid, osGetTime() - 3155673600000ULL);
-    s32 after = playHistorySize();
-    if (landed) *landed = after != before;
-    playCheckLog("note type %lu tid %016llX at minute %lu: result %08lX, size %ld -> %ld\n",
-                 (unsigned long)type, (unsigned long long)tid, (unsigned long)want, (unsigned long)r,
-                 (long)before, (long)after);
+    playCheckLog("note type %lu tid %016llX at minute %lu: result %08lX\n", (unsigned long)type,
+                 (unsigned long long)tid, (unsigned long)want, (unsigned long)r);
     if (R_FAILED(r)) return false;
     PlayEntry e[4];
     int n = playHistoryLast(e, 4);
+    /* landed: the newest entry is this title and type (the length cannot tell - a full ring
+       stays at 73000) */
+    if (landed && n > 0)
+        *landed = (((u64)e[n - 1].tidHigh << 32) | e[n - 1].tidLow) == tid && (e[n - 1].info & 15) == type;
     for (int i = 0; i < n; i++)
         playCheckLog("  read %08lX%08lX type %lu minute %lu\n", (unsigned long)e[i].tidHigh,
                      (unsigned long)e[i].tidLow, (unsigned long)(e[i].info & 15), (unsigned long)(e[i].info >> 4));
