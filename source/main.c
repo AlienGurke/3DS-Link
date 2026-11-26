@@ -119,7 +119,7 @@ enum StrId
     S_C_PEN2, S_C_PENHINT, S_C_PC, S_C_SHIFT, S_C_HINT, S_C_SHIFTHINT, S_C_JUMPLINE, S_C_BLOCK,
     S_C_NOCHANGE,
     S_M_PLAYLOG, S_PL_FAIL, S_PL_OK,
-    S_ARC_OK, S_ARC_FAIL, S_C_HJUMP, S_C_HSET,
+    S_ARC_OK, S_ARC_FAIL, S_C_HJUMP, S_C_HSET, S_ARC_BUSY, S_ARC_SAME,
     S_COUNT
 };
 
@@ -161,6 +161,7 @@ static const char* const g_strs[LANG_COUNT][S_COUNT] = {
         "Activity Log: entry checked",
         "Activity Log: %d new entries archived", "Activity Log archive: could not be written",
         "Time jump (games; left out of stats)", "Set the clock (correction)",
+        "Activity Log: archiving... (first time: a few s)", "Activity Log: archive up to date",
     },
     {   /* Deutsch */
         "3DS Link", "IP-Adresse:", "verbunden", "wartet...", "Steuerung:", "aktiv", "Bild:",
@@ -200,6 +201,7 @@ static const char* const g_strs[LANG_COUNT][S_COUNT] = {
         "Aktivitätslog: Eintrag geprüft",
         "Aktivitätslog: %d neue Einträge archiviert", "Aktivitätslog-Archiv: Schreiben fehlgeschlagen",
         "Zeitsprung (für Spiele, aus Statistik raus)", "Uhr stellen (Korrektur)",
+        "Aktivitätslog wird gesichert... (1. Mal: paar Sek.)", "Aktivitätslog: Archiv aktuell",
     },
 };
 static char g_tr[S_COUNT][80];   /* current language, already in code page 437 */
@@ -227,7 +229,7 @@ static const char* const g_strKeys[S_COUNT] = {
     "clock_real", "clock_penalty1", "clock_penalty2", "clock_penalty_hint", "clock_pc", "clock_shift",
     "clock_hint", "clock_shift_hint", "clock_jump_line", "clock_block", "clock_nochange",
     "menu_playlog", "playlog_fail", "playlog_ok",
-    "archive_ok", "archive_fail", "clock_head_jump", "clock_head_set",
+    "archive_ok", "archive_fail", "clock_head_jump", "clock_head_set", "archive_busy", "archive_same",
 };
 /* the files carry a fingerprint of the built-in texts: when an app update
    changes a text, they are written anew (so the change shows up) */
@@ -4041,6 +4043,7 @@ static void jumpText(char* out, size_t n, s64 seconds)
 }
 
 static int archiveSync(void);
+static void archiveWait(void);
 static void archiveClockNote(const char* fmt, ...);
 static s64 g_arcCount;
 
@@ -4088,6 +4091,7 @@ static bool clockAction(int item)
     if (move == 0) return false;
     /* the archive first: what was noted so far has the clock as it was; from the next entry
        on it is the new one. clock.txt says from which entry (see the doc). */
+    archiveWait();
     bool anchored = archiveSync() >= 0;
     u64 before = osGetTime();
     if (!shiftRawRtc(move)) return false;
@@ -4435,20 +4439,25 @@ static void archiveClockNote(const char* fmt, ...)
 }
 
 /* a title's name from its icon (SMDH), in the app's language, as UTF-8 */
-static bool titleName(u64 tid, FS_MediaType media, char* out, size_t n)
+static bool titleName(u64 tid, FS_MediaType media, char* out, size_t n, Result* why)
 {
+    *why = 0;
     u32 arch[4] = { (u32)tid, (u32)(tid >> 32), media, 0 };
     static const u32 file[5] = { 0, 0, 2, 0x6E6F6369, 0 };   /* ExeFS "icon" */
     FS_Path ap = { PATH_BINARY, sizeof(arch), arch };
     FS_Path fp = { PATH_BINARY, sizeof(file), file };
     Handle h;
-    if (R_FAILED(FSUSER_OpenFileDirectly(&h, ARCHIVE_SAVEDATA_AND_CONTENT, ap, fp, FS_OPEN_READ, 0)))
-        return false;
+    Result r = FSUSER_OpenFileDirectly(&h, ARCHIVE_SAVEDATA_AND_CONTENT, ap, fp, FS_OPEN_READ, 0);
+    if (R_FAILED(r)) { *why = r; return false; }
     static u8 smdh[0x2008];
     u32 got = 0;
-    Result r = FSFILE_Read(h, &got, 0, smdh, sizeof(smdh));
+    r = FSFILE_Read(h, &got, 0, smdh, sizeof(smdh));
     FSFILE_Close(h);
-    if (R_FAILED(r) || got < sizeof(smdh) || memcmp(smdh, "SMDH", 4) != 0) return false;
+    if (R_FAILED(r) || got < sizeof(smdh) || memcmp(smdh, "SMDH", 4) != 0)
+    {
+        *why = R_FAILED(r) ? r : (Result)(0xE0000000 | got);   /* E...: read too short / no SMDH */
+        return false;
+    }
     /* the app's language (German 3, English 1) first, then any other that has a name */
     for (int l = -1; l < 12; l++)
     {
@@ -4474,12 +4483,38 @@ static bool titleName(u64 tid, FS_MediaType media, char* out, size_t n)
     return false;
 }
 
-/* titles.txt: "title id;name" for every installed title not in it yet */
+/* titles.txt: "title id;name" for every installed title not in it yet. Only when the
+   installed titles changed since the last time (titles-state.txt: count and a checksum). */
 static void archiveTitles(void)
 {
+    if (R_FAILED(amInit())) { playCheckLog("titles: AM not available\n"); return; }
+    const FS_MediaType media[3] = { MEDIATYPE_NAND, MEDIATYPE_SD, MEDIATYPE_GAME_CARD };
+    static u64 ids[3][1024];
+    u32 read[3] = { 0, 0, 0 };
+    u64 sum = 0;
+    u32 total = 0;
+    for (int m = 0; m < 3; m++)
+    {
+        u32 count = 0;
+        if (R_FAILED(AM_GetTitleCount(media[m], &count))) continue;
+        if (count > 1024) count = 1024;
+        if (count && R_FAILED(AM_GetTitleList(&read[m], media[m], count, ids[m]))) read[m] = 0;
+        for (u32 j = 0; j < read[m]; j++) sum = sum * 31 + ids[m][j] + (u64)m;
+        total += read[m];
+    }
+    unsigned long long oldSum = 0;
+    unsigned long oldTotal = 0;
+    FILE* f = fopen(ARC_DIR "/titles-state.txt", "r");
+    if (f)
+    {
+        if (fscanf(f, "%lu %llx", &oldTotal, &oldSum) != 2) oldTotal = 0;
+        fclose(f);
+    }
+    if (oldTotal == total && oldSum == sum) { amExit(); return; }   /* nothing new installed */
+
     static u64 known[2048];
     int nk = 0;
-    FILE* f = fopen(ARC_TITLES, "r");
+    f = fopen(ARC_TITLES, "r");
     if (f)
     {
         char line[300];
@@ -4491,32 +4526,79 @@ static void archiveTitles(void)
         }
         fclose(f);
     }
-    if (R_FAILED(amInit())) return;
     f = fopen(ARC_TITLES, "a");
-    const FS_MediaType media[3] = { MEDIATYPE_NAND, MEDIATYPE_SD, MEDIATYPE_GAME_CARD };
-    static u64 ids[1024];
+    int named = 0, failed = 0;
     for (int m = 0; f && m < 3; m++)
-    {
-        u32 count = 0, read = 0;
-        if (R_FAILED(AM_GetTitleCount(media[m], &count))) continue;
-        if (count > 1024) count = 1024;
-        if (count && R_FAILED(AM_GetTitleList(&read, media[m], count, ids))) read = 0;
-        for (u32 j = 0; j < read; j++)
+        for (u32 j = 0; j < read[m]; j++)
         {
-            u32 high = (u32)(ids[j] >> 32);
+            u64 id = ids[m][j];
+            u32 high = (u32)(id >> 32);
             /* what can show up in the Activity Log: games, demos, system programs, applets */
             if (high != 0x00040000 && high != 0x00040002 && high != 0x00040010 && high != 0x00040030)
                 continue;
             bool have = false;
-            for (int i = 0; i < nk && !have; i++) have = known[i] == ids[j];
+            for (int i = 0; i < nk && !have; i++) have = known[i] == id;
+            if (have) continue;
             char name[200];
-            if (have || !titleName(ids[j], media[m], name, sizeof(name))) continue;
-            fprintf(f, "%016llX;%s\n", (unsigned long long)ids[j], name);
-            if (nk < 2048) known[nk++] = ids[j];
+            Result why;
+            if (!titleName(id, media[m], name, sizeof(name), &why))
+            {
+                if (failed++ < 5)
+                    playCheckLog("titles: %016llX (media %d): %08lX\n", (unsigned long long)id, m, (unsigned long)why);
+                continue;
+            }
+            fprintf(f, "%016llX;%s\n", (unsigned long long)id, name);
+            named++;
+            if (nk < 2048) known[nk++] = id;
         }
-    }
     if (f) fclose(f);
     amExit();
+    playCheckLog("titles: %lu installed, %d new names, %d without\n", (unsigned long)total, named, failed);
+    /* next time only if something gets installed or removed (titles without a name are
+       tried again then) */
+    if ((f = fopen(ARC_DIR "/titles-state.txt", "w")))
+    {
+        fprintf(f, "%lu %llx\n", (unsigned long)total, (unsigned long long)sum);
+        fclose(f);
+    }
+}
+
+/* the archive is brought up to date beside the app (it can take a few seconds the first
+   time): the screen stays usable, a line says what is going on */
+static Thread g_arcThread;
+
+static void archiveThread(void* arg)
+{
+    (void)arg;
+    u64 t0 = osGetTime();
+    int added = archiveSync();
+    u64 t1 = osGetTime();
+    archiveTitles();
+    playCheckLog("archive: %d new entries, now %lld, %lu ms; titles %lu ms\n", added, (long long)g_arcCount,
+                 (unsigned long)(t1 - t0), (unsigned long)(osGetTime() - t1));
+    LightLock_Lock(&g_lock);
+    if (added > 0) snprintf(g_statusText, sizeof(g_statusText), T(S_ARC_OK), added);
+    else if (added < 0) snprintf(g_statusText, sizeof(g_statusText), "%s", T(S_ARC_FAIL));
+    else snprintf(g_statusText, sizeof(g_statusText), "%s", T(S_ARC_SAME));
+    LightLock_Unlock(&g_lock);
+}
+
+static void archiveStart(void)
+{
+    snprintf(g_statusText, sizeof(g_statusText), "%s", T(S_ARC_BUSY));
+    s32 prio = 0x30;
+    svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
+    g_arcThread = threadCreate(archiveThread, NULL, 0x8000, prio + 2, -2, false);
+    if (!g_arcThread) archiveThread(NULL);
+}
+
+/* waits until it is done (before the clock is moved, and before the app ends) */
+static void archiveWait(void)
+{
+    if (!g_arcThread) return;
+    threadJoin(g_arcThread, U64_MAX);
+    threadFree(g_arcThread);
+    g_arcThread = NULL;
 }
 
 /* battery, charging, WiFi and the lid. The services are only opened for the
@@ -4594,16 +4676,7 @@ int main(int argc, char** argv)
        before the app ended unexpectedly gets its end now */
     playHistoryDump("app start");
     if (g_playLogOpen) playLogTick(false, 0);
-    {
-        u64 t0 = osGetTime();
-        int added = archiveSync();
-        u64 t1 = osGetTime();
-        archiveTitles();
-        playCheckLog("archive: %d new entries, now %lld, %lu ms; titles %lu ms\n", added, (long long)g_arcCount,
-                     (unsigned long)(t1 - t0), (unsigned long)(osGetTime() - t1));
-        if (added > 0) snprintf(g_statusText, sizeof(g_statusText), T(S_ARC_OK), added);
-        else if (added < 0) snprintf(g_statusText, sizeof(g_statusText), "%s", T(S_ARC_FAIL));
-    }
+    archiveStart();
     loadFavs();
     scanGames();
 
@@ -5652,6 +5725,7 @@ int main(int argc, char** argv)
     }
 
     if (g_playLogOpen) playLogTick(false, 0);   /* the game counts as ended with the app */
+    archiveWait();   /* the archive is never left half-written */
     g_running = false;
     close(g_listenFd);
     threadJoin(inp, U64_MAX);
