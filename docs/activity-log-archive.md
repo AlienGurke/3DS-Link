@@ -153,6 +153,13 @@ inzwischen überschrieben hat. So kommen sie dazu:
    Das Ergebnis ist der alte Stand vollständig, danach alles aus dem neueren ab der Stelle,
    an der sich beide überschneiden (32 Einträge müssen übereinstimmen). Gibt es keine
    Überschneidung, kommt eine Lücke dazwischen.
+   Weil vorne Einträge dazukommen, verschieben sich die Eintrags-Nummern; `clock.txt` mit
+   angeben, dann wird eine passende neue geschrieben:
+   `... merge <alt.bin> <heute.bin> <neu.bin> <clock.txt> <clock-neu.txt>`
+3. Beide neuen Dateien anstelle der alten auf die SD-Karte, während 3DS Link geschlossen ist.
+   Das Ende des Archivs ist unverändert, also macht 3DS Link danach einfach weiter.
+   (Das ist der einzige Fall, in dem das Archiv neu geschrieben wird – als neue Datei; die
+   alte bleibt, bis man sie ersetzt.)
 
 ## Größe und Geschwindigkeit
 
