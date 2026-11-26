@@ -478,7 +478,8 @@ static bool g_statusBar = true;                  /* battery/WiFi top right (sett
 /* state of the console, sent to melonDS with every input packet */
 static volatile u8 g_battery = 255, g_wifi = 255;
 static volatile bool g_charging = false, g_lidClosed = false;
-static volatile bool g_keepAwake = false;        /* melonDS: closing the 3DS keeps the game running */
+static volatile bool g_keepAwake = false;        /* closing the 3DS keeps the game running (the active emulator's setting) */
+static volatile bool g_keepAwakeOf[2] = { false, false };   /* each emulator's setting */
 static volatile u32 g_sockGen = 0;               /* bumped after waking up: sockets are made anew */
 static volatile bool g_netPause = false;         /* the socket service is being restarted: hands off */
 static volatile bool g_wokeUp = false;           /* woke up, not yet connected to melonDS again */
@@ -593,6 +594,7 @@ static void switchActive(u32 client)
     g_statusText[0] = 0;
     g_client = client;
     g_tcpConnected = g_connected[n];
+    g_keepAwake = g_keepAwakeOf[n];
     LightLock_Unlock(&g_lock);
     setVideoGeometry(client);
     g_h264Reset = true;
@@ -1584,7 +1586,10 @@ static bool handleCommand(int fd, const LinkHeader* h, uint8_t* payload, int* ci
         if (h->len < 4) return sendResponse(fd, h, LINK_ERR_BADARGS, NULL, 0);
         u32 opts;
         memcpy(&opts, payload, 4);
-        g_keepAwake = (opts & LINK_OPT_KEEP_AWAKE) != 0;   /* the main thread applies it */
+        /* each emulator says its own; the active one counts (the main thread applies it) */
+        int c = *ci < 0 ? CI(g_client) : *ci;
+        g_keepAwakeOf[c] = (opts & LINK_OPT_KEEP_AWAKE) != 0;
+        if (CLIENT_OF(c) == g_client) g_keepAwake = g_keepAwakeOf[c];
         return sendResponse(fd, h, LINK_OK, NULL, 0);
     }
 
