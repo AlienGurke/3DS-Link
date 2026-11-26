@@ -67,7 +67,7 @@ def move_clock(lines, shift):
     out = []
     for line in lines:
         f = line.split()
-        if len(f) >= 2 and f[0] in ("sprung", "ende", "gestellt") and f[1].lstrip("-").isdigit():
+        if len(f) >= 2 and f[0] in ("jump", "end", "set") and f[1].lstrip("-").isdigit():
             f[1] = str(int(f[1]) + shift)
             line = " ".join(f) + "\n"
         out.append(line)

@@ -4098,17 +4098,17 @@ static bool clockAction(int item)
     if (anchored)
     {
         if (item == CL_PC)
-            archiveClockNote("gestellt %lld %lu %lu", (long long)g_arcCount,
+            archiveClockNote("set %lld %lu %lu", (long long)g_arcCount,
                              (unsigned long)((before - 3155673600000ULL) / 60000),
                              (unsigned long)((before + move * 1000 - 3155673600000ULL) / 60000));
         else
         {
-            if (g_ownJump != 0) archiveClockNote("ende %lld", (long long)g_arcCount);
-            if (jump != 0) archiveClockNote("sprung %lld %+lld", (long long)g_arcCount, (long long)(jump / 60));
+            if (g_ownJump != 0) archiveClockNote("end %lld", (long long)g_arcCount);
+            if (jump != 0) archiveClockNote("jump %lld %+lld", (long long)g_arcCount, (long long)(jump / 60));
         }
     }
     else
-        archiveClockNote("unsicher %s %+lld", item == CL_PC ? "gestellt" : "sprung", (long long)(jump / 60));
+        archiveClockNote("unsure %s %+lld", item == CL_PC ? "set" : "jump", (long long)(jump / 60));
     g_ownJump = jump;
     g_penaltyStep = step;
     saveConfig();
@@ -4621,7 +4621,7 @@ static bool writeIfChanged(const char* path, const u8* data, u32 size)
     return ok;
 }
 
-/* <name>.dat (newest) and <name>-erste.dat (the first one ever taken, never replaced) */
+/* <name>.dat (newest) and <name>-initial.dat (the first one ever taken, never replaced) */
 static void archiveSysFile(const u32* saves, int nsaves, const char* file, const char* base)
 {
     u8* data = NULL;
@@ -4631,7 +4631,7 @@ static void archiveSysFile(const u32* saves, int nsaves, const char* file, const
     for (i = 0; i < nsaves && R_FAILED(r); i++) r = sysSaveRead(saves[i], file, &data, &size);
     if (R_FAILED(r)) { playCheckLog("%s: not readable (%08lX)\n", file, (unsigned long)r); return; }
     char path[128];
-    snprintf(path, sizeof(path), ARC_DIR "/%s-erste.dat", base);
+    snprintf(path, sizeof(path), ARC_DIR "/%s-initial.dat", base);
     FILE* f = fopen(path, "rb");
     if (f) fclose(f);
     else writeIfChanged(path, data, size);

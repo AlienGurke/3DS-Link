@@ -16,8 +16,8 @@ liest**. Sie reicht, um ein eigenes Dashboard oder Werkzeug dafür zu bauen.
 | `playhistory-copy.bin` | Kopie davon (zweite Sicherung auf der SD-Karte) | 3DS Link |
 | `clock.txt` | Zeitsprünge und Uhr-Korrekturen, mit Eintrags-Nummer | 3DS Link (Uhr-Menü) |
 | `titles.txt` | Title-ID → Spielname | 3DS Link (bei jedem Start, nur neue) |
-| `pld.dat` / `pld-erste.dat` | Daten der Aktivitätslog-App (siehe unten): neuester Stand / der erste je gesicherte, wird nie ersetzt | 3DS Link (bei jedem Start, nur wenn geändert) |
-| `Pedometer.dat` / `Pedometer-erste.dat` | Schrittzähler, unverändert aus dem System | 3DS Link (bei jedem Start, nur wenn geändert) |
+| `pld.dat` / `pld-initial.dat` | Daten der Aktivitätslog-App (siehe unten): neuester Stand / der erste je gesicherte, wird nie ersetzt | 3DS Link (bei jedem Start, nur wenn geändert) |
+| `Pedometer.dat` / `Pedometer-initial.dat` | Schrittzähler, unverändert aus dem System | 3DS Link (bei jedem Start, nur wenn geändert) |
 | `playhistory-pc.bin` | gespielt am PC ohne 3DS (Azahar), gleiches Format | Azahar Link (geplant) |
 
 Auf der SD-Karte liegen sie in `sdmc:/3ds/3DS-Link/activity/`.
@@ -110,12 +110,12 @@ Vorzeichen.
 
 | Zeile | Bedeutung | Auswertung |
 |---|---|---|
-| `sprung n ±m` | Zeitsprung über 3DS Link: ab Eintrag *n* geht die Uhr um *m* Minuten falsch (+1440 = einen Tag vor) | bei Einträgen ab *n* die *m* Minuten **abziehen** |
-| `ende n` | ab Eintrag *n* kein Zeitsprung mehr | ab *n* nichts mehr abziehen |
-| `gestellt n alt neu` | Uhr gestellt („Uhr vom PC übernehmen“): eine Korrektur, die Uhr stimmt danach. *alt*, *neu*: Minuten seit 2000 | **nichts** herausrechnen, nur zur Info |
-| `unsicher sprung ±m` / `unsicher gestellt ±m` | wie oben, aber das Archiv war in dem Moment nicht lesbar: die Stelle ist unbekannt | nicht automatisch korrigieren, anzeigen |
+| `jump n ±m` | Zeitsprung über 3DS Link: ab Eintrag *n* geht die Uhr um *m* Minuten falsch (+1440 = einen Tag vor) | bei Einträgen ab *n* die *m* Minuten **abziehen** |
+| `end n` | ab Eintrag *n* kein Zeitsprung mehr | ab *n* nichts mehr abziehen |
+| `set n old new` | Uhr gestellt („Uhr vom PC übernehmen“): eine Korrektur, die Uhr stimmt danach. *old*, *new*: Minuten seit 2000 | **nichts** herausrechnen, nur zur Info |
+| `unsure jump ±m` / `unsure set ±m` | wie oben, aber das Archiv war in dem Moment nicht lesbar: die Stelle ist unbekannt | nicht automatisch korrigieren, anzeigen |
 
-Ein Wechsel von +1 auf +2 Tage steht als `ende n` und `sprung n +2880` da. Die Grenze ist
+Ein Wechsel von +1 auf +2 Tage steht als `end n` und `jump n +2880` da. Die Grenze ist
 exakt: 3DS Link bringt das Archiv auf den neuesten Stand, unmittelbar bevor es die Uhr
 umstellt und den 3DS neu startet.
 
@@ -145,7 +145,7 @@ ihm zeichnet die App ihre Grafiken und die Software-Bibliothek. Little Endian, 8
 Stunden-Eintrag (16 Bytes): u64 Title-ID, u32 Beginn der Stunde in Sekunden seit
 1.1.2000 (Ortszeit wie am 3DS), u32 in dieser Stunde gespielte Sekunden. Unbenutzte Plätze
 sind `FF…`. Die Summen pro Tag/Monat/Jahr der App sind die Summen dieser Werte. Was die
-App ab 50.000 belegten Stunden macht, ist nicht bekannt – deshalb `pld-erste.dat`.
+App ab 50.000 belegten Stunden macht, ist nicht bekannt – deshalb `pld-initial.dat`.
 
 Bibliotheks-Eintrag (24 Bytes): u64 Title-ID, u32 Gesamtspielzeit in Sekunden, u16 Anzahl
 Starts, u16 unbekannt (bisher immer 2), u16 zuerst gespielt, u16 zuletzt gespielt (beide
