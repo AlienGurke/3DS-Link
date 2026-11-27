@@ -48,7 +48,7 @@ if ! command -v bannertool >/dev/null 2>&1; then
 fi
 
 bannertool makebanner -i "$HERE/banner.png" -a "$HERE/banner.wav" -o "$TOOLS/banner.bnr"
-bannertool makesmdh -s "3DS Link" -l "3DS als Controller fuer melonDS und Azahar" -p "AlienGurke" \
+bannertool makesmdh -s "3DS Link" -l "3DS as a controller for melonDS and Azahar" -p "AlienGurke" \
     -i "$HERE/icon.png" -o "$TOOLS/icon.icn"
 
 makerom -f cia -o "$OUT" -elf "$ELF" -rsf "$HERE/app.rsf" \
