@@ -4499,14 +4499,14 @@ static bool writeIfChanged(const char* path, const u8* data, u32 size)
 }
 
 /* <name>.dat (newest) and <name>-initial.dat (the first one ever taken, never replaced) */
-static void archiveSysFile(const u32* saves, int nsaves, const char* file, const char* base)
+static int archiveSysFile(const u32* saves, int nsaves, const char* file, const char* base)
 {
     u8* data = NULL;
     u32 size = 0;
     Result r = -1;
     int i;
     for (i = 0; i < nsaves && R_FAILED(r); i++) r = sysSaveRead(saves[i], file, &data, &size);
-    if (R_FAILED(r)) { playCheckLog("%s: not readable (%08lX)\n", file, (unsigned long)r); return; }
+    if (R_FAILED(r)) { playCheckLog("%s: not readable (%08lX)\n", file, (unsigned long)r); return -1; }
     char path[128];
     snprintf(path, sizeof(path), ARC_DIR "/%s-initial.dat", base);
     FILE* f = fopen(path, "rb");
@@ -4517,6 +4517,7 @@ static void archiveSysFile(const u32* saves, int nsaves, const char* file, const
     playCheckLog("%s (save %08lX): %lu bytes, %s\n", file, (unsigned long)saves[i - 1], (unsigned long)size,
                  changed ? "saved" : "unchanged");
     free(data);
+    return changed ? 1 : 0;
 }
 
 static void archiveSysFiles(void)
@@ -4524,77 +4525,117 @@ static void archiveSysFiles(void)
     /* the Activity Log app's save: 0002xxyy from its title 000400100002xx00 (EUR, USA,
        JPN, CHN, KOR, TWN) */
     static const u32 pld[6] = { 0x00020222, 0x00020212, 0x00020202, 0x00020262, 0x00020272, 0x00020282 };
-    static const u32 ptm[1] = { 0x00010022 };
     /* the HOME Menu's icon cache (names and pictures of titles it has shown, also ones that
        are deleted by now): NAND shared extdata F000000B */
     static const u32 home[1] = { 0xF000000B };
     archiveSysFile(pld, 6, "/pld.dat", "pld");
-    archiveSysFile(ptm, 1, "/Pedometer.dat", "Pedometer");
-    archiveSysFile(home, 1, "/idb.dat", "idb");
-    archiveSysFile(home, 1, "/idbt.dat", "idbt");
+    /* idb.dat is 7 MB: only when its index (idbt.dat) changed or it is not there yet */
+    FILE* f = fopen(ARC_DIR "/idb.dat", "rb");
+    if (f) fclose(f);
+    if (archiveSysFile(home, 1, "/idbt.dat", "idbt") != 0 || !f) archiveSysFile(home, 1, "/idb.dat", "idb");
 }
 
 /* the step counter, hour by hour, as PTM gives it (PTM:GetStepHistory: n hours from a time
    in ms since 2000 on, oldest first - checked on a real 3DS). Its own file (Pedometer.dat)
    is kept open by PTM, so this asks PTM. Stored day by day since 2011 (steps.bin). */
+static Result stepsAsk(Handle h, u64 from, u32 hours, u16* out)
+{
+    u32* cmd = getThreadCommandBuffer();
+    cmd[0] = IPC_MakeHeader(0xB, 3, 2);
+    cmd[1] = hours;
+    cmd[2] = (u32)from;
+    cmd[3] = (u32)(from >> 32);
+    cmd[4] = IPC_Desc_Buffer(hours * 2, IPC_BUFFER_W);
+    cmd[5] = (u32)(uintptr_t)out;
+#ifdef LINK_HOST_TEST
+    shim_out_ptr = out;
+#endif
+    Result r = svcSendSyncRequest(h);
+    if (R_SUCCEEDED(r)) r = (Result)cmd[1];
+    return r;
+}
+
+/* only what is new: the days already in steps.bin stay, the last 3 (today is still running)
+   are asked again. The first time everything since 2011, 30 days per request (one request
+   per day kept PTM - and with it the HOME button - busy for over a minute). */
 static int archiveSteps(void)
 {
-    Handle h;
-    if (R_FAILED(srvGetServiceHandle(&h, "ptm:u"))) return -1;
     const u64 day = 86400000ULL;
-    /* from the 3DS's launch year on: what a console never counted comes back as 0 */
+    const size_t recSize = 8 + 4 + 48;
     const u64 first = (u64)(daysSince1900(2011, 1, 1) - daysSince1900(2000, 1, 1)) * day;
     const u64 now = osGetTime() - 3155673600000ULL;
-    if (now < first) { svcCloseHandle(h); playCheckLog("steps: the clock is before 2011\n"); return -1; }
+    if (now < first) { playCheckLog("steps: the clock is before 2011\n"); return -1; }
     const u32 days = (u32)((now - first) / day) + 1;
-    const size_t recSize = 8 + 4 + 48;
     u8* out = (u8*)malloc(16 + (size_t)days * recSize);
-    if (!out) { svcCloseHandle(h); playCheckLog("steps: no memory\n"); return -1; }
+    if (!out) { playCheckLog("steps: no memory\n"); return -1; }
     memcpy(out, "3DSSTEPS", 8);
     u32 head[2] = { 1, (u32)recSize };
     memcpy(out + 8, head, 8);
-    size_t len = 16;
-    Result r = 0;
-    u32 nonzero = 0;
-    for (u32 d = 0; d < days && R_SUCCEEDED(r); d++)
+    /* what is there already (day d at 16 + d * recSize) */
+    u32 have = 0;
+    FILE* f = fopen(ARC_DIR "/steps.bin", "rb");
+    if (f)
     {
-        u64 t = first + (u64)d * day;   /* PTM gives the hours from this time on */
-        u16 v[24];
+        u8 h[16];
+        if (fread(h, 1, 16, f) == 16 && memcmp(h, out, 16) == 0)
+            have = (u32)(fread(out + 16, recSize, days, f));
+        fclose(f);
+    }
+    u32 from = have > 3 ? have - 3 : 0;
+    Handle h;
+    if (R_FAILED(srvGetServiceHandle(&h, "ptm:u"))) { free(out); playCheckLog("steps: no ptm:u\n"); return -1; }
+    static u16 v[24 * 30];
+    u32 chunk = 30, asked = 0, nonzero = 0;
+    Result r = 0;
+    /* one request of 30 days must give what the days already stored say (they may have come
+       day by day): otherwise ask day by day */
+    if (from >= 30)
+    {
+        u32 c = from - 30;
         memset(v, 0, sizeof(v));
-        u32* cmd = getThreadCommandBuffer();
-        cmd[0] = IPC_MakeHeader(0xB, 3, 2);
-        cmd[1] = 24;
-        cmd[2] = (u32)t;
-        cmd[3] = (u32)(t >> 32);
-        cmd[4] = IPC_Desc_Buffer(sizeof(v), IPC_BUFFER_W);
-        cmd[5] = (u32)(uintptr_t)v;
-#ifdef LINK_HOST_TEST
-        shim_out_ptr = v;
-#endif
-        r = svcSendSyncRequest(h);
-        if (R_SUCCEEDED(r)) r = (Result)cmd[1];
+        bool same = R_SUCCEEDED(stepsAsk(h, first + (u64)c * day, 30 * 24, v));
+        for (u32 k = 0; same && k < 30; k++)
+            same = memcmp(out + 16 + (size_t)(c + k) * recSize + 12, v + k * 24, 48) == 0;
+        asked++;
+        if (!same) chunk = 1;
+        playCheckLog("steps: 30 days at once %s\n", same ? "match the stored days" : "differ - asking day by day");
+    }
+    u32 d = from;
+    while (d < days)
+    {
+        u32 n = days - d < chunk ? days - d : chunk;
+        memset(v, 0, sizeof(v));
+        r = stepsAsk(h, first + (u64)d * day, n * 24, v);
+        asked++;
+        if (R_FAILED(r) && chunk > 1) { chunk = 1; continue; }   /* if PTM wants smaller requests */
         if (R_FAILED(r)) break;
-        memcpy(out + len, &t, 8);
-        u32 n = 24;
-        memcpy(out + len + 8, &n, 4);
-        memcpy(out + len + 12, v, sizeof(v));
-        len += recSize;
-        for (int i = 0; i < 24; i++) nonzero += v[i] != 0;
+        for (u32 k = 0; k < n; k++)
+        {
+            u8* rec = out + 16 + (size_t)(d + k) * recSize;
+            u64 t = first + (u64)(d + k) * day;
+            u32 hours = 24;
+            memcpy(rec, &t, 8);
+            memcpy(rec + 8, &hours, 4);
+            memcpy(rec + 12, v + k * 24, 48);
+            for (int i = 0; i < 24; i++) nonzero += v[k * 24 + i] != 0;
+        }
+        d += n;
     }
     svcCloseHandle(h);
     if (R_FAILED(r)) playCheckLog("steps: PTM said %08lX\n", (unsigned long)r);
+    u32 total = d;   /* days now known */
     int ret = -1;
-    if (len > 16)
+    if (total > 0)
     {
-        char path[96];
-        snprintf(path, sizeof(path), ARC_DIR "/steps-initial.bin");
-        FILE* f = fopen(path, "rb");
-        if (f) fclose(f);
-        else writeIfChanged(path, out, (u32)len);
+        size_t len = 16 + (size_t)total * recSize;
+        FILE* fi = fopen(ARC_DIR "/steps-initial.bin", "rb");
+        if (fi) fclose(fi);
+        else writeIfChanged(ARC_DIR "/steps-initial.bin", out, (u32)len);
         bool changed = writeIfChanged(ARC_DIR "/steps.bin", out, (u32)len);
-        playCheckLog("steps: %lu days, %lu hours with steps, %s\n", (unsigned long)((len - 16) / recSize),
-                     (unsigned long)nonzero, changed ? "saved" : "unchanged");
-        ret = (int)((len - 16) / recSize);
+        playCheckLog("steps: %lu days (from day %lu asked again, %lu requests of %lu days), %s\n",
+                     (unsigned long)total, (unsigned long)from, (unsigned long)asked, (unsigned long)chunk,
+                     changed ? "saved" : "unchanged");
+        ret = (int)(total - from);
     }
     free(out);
     return ret;

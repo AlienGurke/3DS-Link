@@ -156,8 +156,9 @@ genau wie in der App angezeigt.
 PTM hält seine Datei `Pedometer.dat` offen, sie lässt sich nicht kopieren. Deshalb fragt
 3DS Link PTM selbst (`PTM:GetStepHistory`: *n* Stunden **ab** einer Zeit in ms seit
 1.1.2000, ältester zuerst – an einem echten 3DS mit den Tageswerten der Aktivitätslog-App
-geprüft), Tag für Tag ab 1.1.2011 (Erscheinungsjahr des 3DS). Tage vor der ersten
-Benutzung kommen als 0.
+geprüft), ab 1.1.2011 (Erscheinungsjahr des 3DS). Tage vor der ersten Benutzung kommen als
+0. Nur das erste Mal wird alles erfragt (30 Tage je Anfrage); danach bleiben die gespeicherten
+Tage, und nur die letzten 3 werden neu erfragt.
 
 Kopf 16 Bytes: `3DSSTEPS`, u32 Version (1), u32 Größe eines Datensatzes (60). Datensatz:
 u64 Beginn des Tages (ms seit 1.1.2000, Ortszeit), u32 Stunden (24), 24 × u16 Schritte
