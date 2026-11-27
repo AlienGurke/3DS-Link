@@ -4359,12 +4359,6 @@ static int archiveSync(void)
         return -1;
     PlayEntry* ring = (PlayEntry*)malloc(sizeof(PlayEntry) * (size ? size : 1));
     if (!ring) return -1;
-    for (s32 o = 0; o < size;)
-    {
-        s32 n = size - o > 2048 ? 2048 : size - o;
-        if (R_FAILED(playHistoryRead(o, n, ring + o))) { free(ring); return -1; }
-        o += n;
-    }
     s64 count = 0;
     FILE* f = fopen(ARC_FILE, "r+b");
     if (f)
@@ -4398,10 +4392,24 @@ static int archiveSync(void)
     {
         fseek(f, 16 + (long)(count - k) * 12, SEEK_SET);
         if (fread(tail, sizeof(PlayEntry), k, f) != (size_t)k) { fclose(f); free(ring); return -1; }
-        from = -1;
-        for (s32 p = size; p >= k; p--)   /* the newest place first */
+    }
+    /* the 3DS's log is read from its newest end backwards, 2048 entries at a time, only until
+       the archive's last entries turn up - usually in the first piece */
+    s32 lo = size, searched = size + 1;
+    from = -1;
+    while (from < 0)
+    {
+        s32 n = lo > 2048 ? 2048 : lo;
+        if (n > 0)
+        {
+            lo -= n;
+            if (R_FAILED(playHistoryRead(lo, n, ring + lo))) { fclose(f); free(ring); return -1; }
+        }
+        if (k == 0) { if (lo == 0) from = 0; continue; }   /* a new archive takes everything */
+        for (s32 p = searched - 1; p >= lo + k; p--)   /* the newest place first */
             if (memcmp(ring + p - k, tail, sizeof(PlayEntry) * k) == 0) { from = p; break; }
-        if (from < 0) { from = 0; gap = true; }
+        searched = lo + k;
+        if (from < 0 && lo == 0) { from = 0; gap = true; }
     }
     s32 add = size - from;
     bool ok = true;
@@ -4578,8 +4586,28 @@ static int archiveSteps(void)
     {
         u8 h[16];
         if (fread(h, 1, 16, f) == 16 && memcmp(h, out, 16) == 0)
+        {
+            fseek(f, 0, SEEK_END);
+            long all = (ftell(f) - 16) / (long)recSize;
+            if (all > (long)days)
+            {
+                /* the clock is behind what is stored (moved back, or reset): nothing changes */
+                fclose(f);
+                free(out);
+                playCheckLog("steps: the clock is before the stored days - left as they are\n");
+                return 0;
+            }
+            fseek(f, 16, SEEK_SET);
             have = (u32)(fread(out + 16, recSize, days, f));
+        }
         fclose(f);
+    }
+    if (have > days)
+    {
+        /* the clock is behind what is stored (moved back, or reset): nothing is changed */
+        free(out);
+        playCheckLog("steps: the clock is before the stored days - left as they are\n");
+        return 0;
     }
     u32 from = have > 3 ? have - 3 : 0;
     Handle h;
