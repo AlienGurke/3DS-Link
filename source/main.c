@@ -4669,6 +4669,29 @@ static int archiveSteps(void)
     return ret;
 }
 
+/* console.txt: which console this archive is from, so archives of several consoles (an
+   old 3DS, a New 3DS XL, ...) can be shown side by side. Written once; "name" can be
+   changed by hand. */
+static void archiveConsole(void)
+{
+    FILE* f = fopen(ARC_DIR "/console.txt", "r");
+    if (f) { fclose(f); return; }
+    static const char* const models[] = { "3DS", "3DS XL", "New 3DS", "2DS", "New 3DS XL", "New 2DS XL" };
+    u8 model = 0xFF;
+    u64 hash = 0;
+    if (R_SUCCEEDED(cfguInit()))
+    {
+        CFGU_GetSystemModel(&model);
+        CFGU_GenHashConsoleUnique(0x3D5A, &hash);   /* differs per console, says nothing else */
+        cfguExit();
+    }
+    f = fopen(ARC_DIR "/console.txt", "w");
+    if (!f) return;
+    const char* m = model < 6 ? models[model] : "?";
+    fprintf(f, "model=%s\nid=%016llX\nname=%s\n", m, (unsigned long long)hash, m);
+    fclose(f);
+}
+
 /* the archive is brought up to date beside the app (it can take a few seconds the first
    time): the screen stays usable, a line says what is going on */
 static Thread g_arcThread;
@@ -4680,6 +4703,7 @@ static void archiveThread(void* arg)
     g_arcBusy = true;
     u64 t0 = osGetTime();
     int added = archiveSync();
+    archiveConsole();
     u64 t1 = osGetTime();
     archiveSysFiles();
     archiveSteps();

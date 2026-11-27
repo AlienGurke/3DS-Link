@@ -18,6 +18,7 @@ liest**. Sie reicht, um ein eigenes Dashboard oder Werkzeug dafür zu bauen.
 | `pld.dat` / `pld-initial.dat` | Daten der Aktivitätslog-App (siehe unten): neuester Stand / der erste je gesicherte, wird nie ersetzt | 3DS Link (bei jedem Start, nur wenn geändert) |
 | `steps.bin` / `steps-initial.bin` | Schritte pro Stunde, vom System erfragt (siehe unten) | 3DS Link (bei jedem Start, nur wenn geändert) |
 | `idb.dat` / `idbt.dat` (+ `-initial`) | Icon-Speicher des HOME-Menüs (Namen, Bilder) | 3DS Link (bei jedem Start, nur wenn geändert) |
+| `console.txt` | von welcher Konsole (Modell, Kennung, Name – den darf man ändern) | 3DS Link (einmal) |
 | `playhistory-pc.bin` | gespielt am PC ohne 3DS (Azahar), gleiches Format | Azahar Link (geplant) |
 
 Auf der SD-Karte liegen sie in `sdmc:/3ds/3DS-Link/activity/`.
@@ -101,6 +102,31 @@ oder mit anderen Tools verstellt) sollte ein Dashboard:
 
 - eine Sitzung verwerfen, deren Ende vor ihrem Beginn liegt oder die unplausibel lang ist,
 - Sitzungen nach ihrer Startzeit dem Tag zuordnen (so macht es auch der 3DS).
+
+### Zurückgesetzte Uhr (leerer Akku)
+
+Fällt die Uhr zurück (der 3DS setzt sie z. B. auf 01.01.2011 00:00), stehen die folgenden
+Einträge mit falschem Datum da, bis die Uhr wieder gestellt wird. Das System trägt beides
+selbst ein (Ereignis 11/12: alte → neue Zeit). Daraus lässt sich der Abschnitt genau
+korrigieren, ohne Einstellung und für jede Konsole:
+
+1. Ein Abschnitt beginnt bei einem Ereignis 11/12, dessen neue Zeit weit (mehr als einen
+   Tag) **vor** dem letzten Eintrag davor liegt (Uhr zurückgefallen).
+2. Er endet beim nächsten Ereignis 11/12, das die Uhr wieder nach vorn stellt.
+3. Alle Einträge dazwischen bekommen dessen Unterschied (neu − alt) dazu – die Uhr lief in
+   der Zeit ja weiter, nur von einem falschen Startwert aus.
+4. Endet ein Abschnitt ohne solches Ereignis (z. B. mit einem anderen Tool gestellt), wird er
+   als „Datum unbekannt“ geführt: zählt zur Spielzeit, aber zu keinem Tag.
+
+In `pld.dat` stehen solche Stunden ebenfalls mit falschem Datum; für die Zeit, die
+`playhistory.bin` abdeckt, nimmt man die Sitzungen von dort.
+
+## `console.txt`
+
+Text, `schlüssel=wert`: `model` (3DS, 3DS XL, New 3DS, 2DS, New 3DS XL, New 2DS XL), `id`
+(eine Kennung, die je Konsole verschieden ist und sonst nichts verrät), `name` (anfangs das
+Modell; frei änderbar, z. B. „Mein alter 3DS“). Mehrere Konsolen: je ein `activity`-Ordner;
+ein Dashboard kann sie getrennt und zusammen zeigen.
 
 ## `clock.txt`
 
