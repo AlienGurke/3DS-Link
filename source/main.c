@@ -4537,10 +4537,27 @@ static void archiveSysFiles(void)
        are deleted by now): NAND shared extdata F000000B */
     static const u32 home[1] = { 0xF000000B };
     archiveSysFile(pld, 6, "/pld.dat", "pld");
-    /* idb.dat is 7 MB: only when its index (idbt.dat) changed or it is not there yet */
-    FILE* f = fopen(ARC_DIR "/idb.dat", "rb");
-    if (f) fclose(f);
-    if (archiveSysFile(home, 1, "/idbt.dat", "idbt") != 0 || !f) archiveSysFile(home, 1, "/idb.dat", "idb");
+    /* idb.dat is 7 MB: read again only if a slot of its index got another title (the index
+       also notes when each title was last shown, which changes with every start) */
+    u8 before[8200];
+    bool had = false, haveIdb = false;
+    FILE* f = fopen(ARC_DIR "/idbt.dat", "rb");
+    if (f) { had = fread(before, 1, sizeof(before), f) == sizeof(before); fclose(f); }
+    f = fopen(ARC_DIR "/idb.dat", "rb");
+    if (f) { haveIdb = true; fclose(f); }
+    archiveSysFile(home, 1, "/idbt.dat", "idbt");
+    bool newTitle = !had || !haveIdb;
+    if (!newTitle)
+    {
+        u8 now[8200];
+        f = fopen(ARC_DIR "/idbt.dat", "rb");
+        if (f && fread(now, 1, sizeof(now), f) == sizeof(now))
+            for (int i = 0; i < 512 && !newTitle; i++)
+                newTitle = memcmp(before + 8 + i * 16, now + 8 + i * 16, 8) != 0;   /* the title id */
+        else newTitle = true;
+        if (f) fclose(f);
+    }
+    if (newTitle) archiveSysFile(home, 1, "/idb.dat", "idb");
 }
 
 /* the step counter, hour by hour, as PTM gives it (PTM:GetStepHistory: n hours from a time
@@ -4565,7 +4582,8 @@ static Result stepsAsk(Handle h, u64 from, u32 hours, u16* out)
 
 /* only what is new: the days already in steps.bin stay, the last 3 (today is still running)
    are asked again. The first time everything since 2011, 30 days per request (one request
-   per day kept PTM - and with it the HOME button - busy for over a minute). */
+   per day kept PTM - and with it the HOME button - busy for over a minute; 30 days at once
+   give exactly the same, checked on a real 3DS). */
 static int archiveSteps(void)
 {
     const u64 day = 86400000ULL;
@@ -4615,19 +4633,6 @@ static int archiveSteps(void)
     static u16 v[24 * 30];
     u32 chunk = 30, asked = 0, nonzero = 0;
     Result r = 0;
-    /* one request of 30 days must give what the days already stored say (they may have come
-       day by day): otherwise ask day by day */
-    if (from >= 30)
-    {
-        u32 c = from - 30;
-        memset(v, 0, sizeof(v));
-        bool same = R_SUCCEEDED(stepsAsk(h, first + (u64)c * day, 30 * 24, v));
-        for (u32 k = 0; same && k < 30; k++)
-            same = memcmp(out + 16 + (size_t)(c + k) * recSize + 12, v + k * 24, 48) == 0;
-        asked++;
-        if (!same) chunk = 1;
-        playCheckLog("steps: 30 days at once %s\n", same ? "match the stored days" : "differ - asking day by day");
-    }
     u32 d = from;
     while (d < days)
     {
