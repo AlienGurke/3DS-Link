@@ -4323,7 +4323,6 @@ static void playLogTick(bool on, u64 gameTid)
 #define ARC_FILE ARC_DIR "/playhistory.bin"
 #define ARC_COPY ARC_DIR "/playhistory-copy.bin"
 #define ARC_CLOCK ARC_DIR "/clock.txt"
-#define ARC_TITLES ARC_DIR "/titles.txt"
 #define ARC_OVERLAP 32
 static const u8 ARC_MAGIC[8] = { '3', 'D', 'S', 'P', 'L', 'A', 'Y', 0 };
 static s64 g_arcCount = -1;   /* entries in the archive after the last sync, -1: unknown */
@@ -4438,133 +4437,6 @@ static void archiveClockNote(const char* fmt, ...)
     fclose(f);
 }
 
-/* a title's name from its icon (SMDH), in the app's language, as UTF-8 */
-static bool titleName(u64 tid, FS_MediaType media, char* out, size_t n, Result* why)
-{
-    *why = 0;
-    u32 arch[4] = { (u32)tid, (u32)(tid >> 32), media, 0 };
-    static const u32 file[5] = { 0, 0, 2, 0x6E6F6369, 0 };   /* ExeFS "icon" */
-    FS_Path ap = { PATH_BINARY, sizeof(arch), arch };
-    FS_Path fp = { PATH_BINARY, sizeof(file), file };
-    Handle h;
-    Result r = FSUSER_OpenFileDirectly(&h, ARCHIVE_SAVEDATA_AND_CONTENT, ap, fp, FS_OPEN_READ, 0);
-    if (R_FAILED(r)) { *why = r; return false; }
-    static u8 smdh[0x2008];
-    u32 got = 0;
-    r = FSFILE_Read(h, &got, 0, smdh, sizeof(smdh));
-    FSFILE_Close(h);
-    if (R_FAILED(r) || got < sizeof(smdh) || memcmp(smdh, "SMDH", 4) != 0)
-    {
-        *why = R_FAILED(r) ? r : (Result)(0xE0000000 | got);   /* E...: read too short / no SMDH */
-        return false;
-    }
-    /* the app's language (German 3, English 1) first, then any other that has a name */
-    for (int l = -1; l < 12; l++)
-    {
-        const u8* s = smdh + 8 + (l < 0 ? (g_lang == LANG_DE ? 3 : 1) : l) * 0x200;   /* short name, 0x40 UTF-16 characters */
-        size_t o = 0;
-        for (int i = 0; i < 0x40; i++)
-        {
-            u32 c = s[i * 2] | (s[i * 2 + 1] << 8);
-            if (c == 0) break;
-            if (c == '\n' || c == '\r' || c == ';') c = ' ';
-            if (c < 0x80 && o + 1 < n) out[o++] = (char)c;
-            else if (c < 0x800 && o + 2 < n) { out[o++] = (char)(0xC0 | c >> 6); out[o++] = (char)(0x80 | (c & 63)); }
-            else if (c >= 0x800 && o + 3 < n)
-            {
-                out[o++] = (char)(0xE0 | c >> 12);
-                out[o++] = (char)(0x80 | (c >> 6 & 63));
-                out[o++] = (char)(0x80 | (c & 63));
-            }
-        }
-        out[o] = 0;
-        if (o > 0) return true;
-    }
-    return false;
-}
-
-/* titles.txt: "title id;name" for every installed title not in it yet. Only when the
-   installed titles changed since the last time (titles-state.txt: count and a checksum). */
-static void archiveTitles(void)
-{
-    if (R_FAILED(amInit())) { playCheckLog("titles: AM not available\n"); return; }
-    const FS_MediaType media[3] = { MEDIATYPE_NAND, MEDIATYPE_SD, MEDIATYPE_GAME_CARD };
-    static u64 ids[3][1024];
-    u32 read[3] = { 0, 0, 0 };
-    u64 sum = 0;
-    u32 total = 0;
-    for (int m = 0; m < 3; m++)
-    {
-        u32 count = 0;
-        if (R_FAILED(AM_GetTitleCount(media[m], &count))) continue;
-        if (count > 1024) count = 1024;
-        if (count && R_FAILED(AM_GetTitleList(&read[m], media[m], count, ids[m]))) read[m] = 0;
-        for (u32 j = 0; j < read[m]; j++) sum = sum * 31 + ids[m][j] + (u64)m;
-        total += read[m];
-    }
-    unsigned long long oldSum = 0;
-    unsigned long oldTotal = 0;
-    FILE* f = fopen(ARC_DIR "/titles-state.txt", "r");
-    if (f)
-    {
-        unsigned long ver = 0;   /* a new version of this looks again at every title */
-        if (fscanf(f, "%lu %lu %llx", &ver, &oldTotal, &oldSum) != 3 || ver != 2) oldTotal = 0;
-        fclose(f);
-    }
-    if (oldTotal == total && oldSum == sum) { amExit(); return; }   /* nothing new installed */
-
-    static u64 known[2048];
-    int nk = 0;
-    f = fopen(ARC_TITLES, "r");
-    if (f)
-    {
-        char line[300];
-        while (nk < 2048 && fgets(line, sizeof(line), f))
-        {
-            char* end;
-            u64 t = strtoull(line, &end, 16);
-            if (end != line && *end == ';') known[nk++] = t;
-        }
-        fclose(f);
-    }
-    f = fopen(ARC_TITLES, "a");
-    int named = 0, failed = 0, failedOf[3] = { 0, 0, 0 };
-    for (int m = 0; f && m < 3; m++)
-        for (u32 j = 0; j < read[m]; j++)
-        {
-            u64 id = ids[m][j];
-            u32 high = (u32)(id >> 32);
-            /* what can show up in the Activity Log: games, demos, system programs, applets */
-            if (high != 0x00040000 && high != 0x00040002 && high != 0x00040010 && high != 0x00040030)
-                continue;
-            bool have = false;
-            for (int i = 0; i < nk && !have; i++) have = known[i] == id;
-            if (have) continue;
-            char name[200];
-            Result why;
-            if (!titleName(id, media[m], name, sizeof(name), &why))
-            {
-                if (failedOf[m]++ < 3)
-                    playCheckLog("titles: %016llX (media %d): %08lX\n", (unsigned long long)id, m, (unsigned long)why);
-                failed++;
-                continue;
-            }
-            fprintf(f, "%016llX;%s\n", (unsigned long long)id, name);
-            named++;
-            if (nk < 2048) known[nk++] = id;
-        }
-    if (f) fclose(f);
-    amExit();
-    playCheckLog("titles: %lu installed, %d new names, %d without\n", (unsigned long)total, named, failed);
-    /* next time only if something gets installed or removed (titles without a name are
-       tried again then) */
-    if ((f = fopen(ARC_DIR "/titles-state.txt", "w")))
-    {
-        fprintf(f, "2 %lu %llx\n", (unsigned long)total, (unsigned long long)sum);
-        fclose(f);
-    }
-}
-
 /* a file from a system save (only read): the Activity Log app's own data (pld.dat: play time
    per title and hour since the 3DS was first used, and the per-title totals of its software
    library) and the step counter (Pedometer.dat in PTM's save). */
@@ -4662,18 +4534,18 @@ static void archiveSysFiles(void)
     archiveSysFile(home, 1, "/idbt.dat", "idbt");
 }
 
-/* the step counter, hour by hour, as PTM gives it (PTM:GetStepHistory: n hours up to a time
-   in ms since 2000). Its own file (Pedometer.dat) is kept open by PTM, so this asks PTM.
-   Stored raw, day by day since 2016 (steps.bin, see the doc): which end of a request the
-   time means is not documented, so each request is kept with its time. */
+/* the step counter, hour by hour, as PTM gives it (PTM:GetStepHistory: n hours from a time
+   in ms since 2000 on, oldest first - checked on a real 3DS). Its own file (Pedometer.dat)
+   is kept open by PTM, so this asks PTM. Stored day by day since 2011 (steps.bin). */
 static int archiveSteps(void)
 {
     Handle h;
     if (R_FAILED(srvGetServiceHandle(&h, "ptm:u"))) return -1;
     const u64 day = 86400000ULL;
-    const u64 first = (u64)(daysSince1900(2016, 1, 1) - daysSince1900(2000, 1, 1)) * day;
+    /* from the 3DS's launch year on: what a console never counted comes back as 0 */
+    const u64 first = (u64)(daysSince1900(2011, 1, 1) - daysSince1900(2000, 1, 1)) * day;
     const u64 now = osGetTime() - 3155673600000ULL;
-    if (now < first) { svcCloseHandle(h); playCheckLog("steps: the clock is before 2016\n"); return -1; }
+    if (now < first) { svcCloseHandle(h); playCheckLog("steps: the clock is before 2011\n"); return -1; }
     const u32 days = (u32)((now - first) / day) + 1;
     const size_t recSize = 8 + 4 + 48;
     u8* out = (u8*)malloc(16 + (size_t)days * recSize);
@@ -4686,7 +4558,7 @@ static int archiveSteps(void)
     u32 nonzero = 0;
     for (u32 d = 0; d < days && R_SUCCEEDED(r); d++)
     {
-        u64 t = first + (u64)(d + 1) * day;   /* the end of that day */
+        u64 t = first + (u64)d * day;   /* PTM gives the hours from this time on */
         u16 v[24];
         memset(v, 0, sizeof(v));
         u32* cmd = getThreadCommandBuffer();
@@ -4731,22 +4603,24 @@ static int archiveSteps(void)
 /* the archive is brought up to date beside the app (it can take a few seconds the first
    time): the screen stays usable, a line says what is going on */
 static Thread g_arcThread;
+static volatile bool g_arcBusy;
 
 static void archiveThread(void* arg)
 {
     (void)arg;
+    g_arcBusy = true;
     u64 t0 = osGetTime();
     int added = archiveSync();
     u64 t1 = osGetTime();
     archiveSysFiles();
     archiveSteps();
-    archiveTitles();
-    playCheckLog("archive: %d new entries, now %lld, %lu ms; titles %lu ms\n", added, (long long)g_arcCount,
-                 (unsigned long)(t1 - t0), (unsigned long)(osGetTime() - t1));
+    playCheckLog("archive: %d new entries, now %lld, %lu ms; system data and steps %lu ms\n", added,
+                 (long long)g_arcCount, (unsigned long)(t1 - t0), (unsigned long)(osGetTime() - t1));
     LightLock_Lock(&g_lock);
     if (added > 0) snprintf(g_statusText, sizeof(g_statusText), T(S_ARC_OK), added);
     else if (added < 0) snprintf(g_statusText, sizeof(g_statusText), "%s", T(S_ARC_FAIL));
     else snprintf(g_statusText, sizeof(g_statusText), "%s", T(S_ARC_SAME));
+    g_arcBusy = false;
     LightLock_Unlock(&g_lock);
 }
 
@@ -5564,7 +5438,9 @@ int main(int argc, char** argv)
         /* ---------------- top screen ---------------- */
         char status[128], game[128], xi[64], xi2[64];
         LightLock_Lock(&g_lock);
-        snprintf(status, sizeof(status), "%s", g_statusText);
+        /* while the Activity Log is being archived, the line says so (unless something
+           more important is shown) */
+        snprintf(status, sizeof(status), "%s", g_statusText[0] || !g_arcBusy ? g_statusText : T(S_ARC_BUSY));
         snprintf(game, sizeof(game), "%s", g_currentGame);
         snprintf(xi, sizeof(xi), "%s", g_xferInfo);
         snprintf(xi2, sizeof(xi2), "%s", g_xferInfo2);

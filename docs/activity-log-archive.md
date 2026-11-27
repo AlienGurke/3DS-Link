@@ -15,7 +15,6 @@ liest**. Sie reicht, um ein eigenes Dashboard oder Werkzeug dafür zu bauen.
 | `playhistory.bin` | die Einträge vom 3DS, unverändert, ältester zuerst, nur angehängt | 3DS Link (bei jedem Start), Werkzeuge in `tools/activity-log/` |
 | `playhistory-copy.bin` | Kopie davon (zweite Sicherung auf der SD-Karte) | 3DS Link |
 | `clock.txt` | Zeitsprünge und Uhr-Korrekturen, mit Eintrags-Nummer | 3DS Link (Uhr-Menü) |
-| `titles.txt` | Title-ID → Spielname | 3DS Link (bei jedem Start, nur neue) |
 | `pld.dat` / `pld-initial.dat` | Daten der Aktivitätslog-App (siehe unten): neuester Stand / der erste je gesicherte, wird nie ersetzt | 3DS Link (bei jedem Start, nur wenn geändert) |
 | `steps.bin` / `steps-initial.bin` | Schritte pro Stunde, vom System erfragt (siehe unten) | 3DS Link (bei jedem Start, nur wenn geändert) |
 | `idb.dat` / `idbt.dat` (+ `-initial`) | Icon-Speicher des HOME-Menüs (Namen, Bilder) | 3DS Link (bei jedem Start, nur wenn geändert) |
@@ -125,11 +124,6 @@ als Ereignis 11/12 ein; es ist eine Korrektur und wird nicht herausgerechnet –
 Zeitsprung von 3DS Link bleibt dabei bestehen, denn er sitzt in der Hardware-Uhr). Uhr mit
 anderen Tools (z. B. RTChanger) verstellt: nicht erkennbar.
 
-## `titles.txt`
-
-Text, UTF-8, eine Zeile pro Spiel: `Title-ID (16 Hex-Ziffern);Name`. Spätere Zeilen gelten
-vor früheren (ein Name kann sich ändern). Fehlt eine Title-ID, zeigt man die Nummer.
-
 ## `pld.dat` (Aktivitätslog-App)
 
 Der Spielstand der Aktivitätslog-App (System-Spielstand `0002xxyy`, bei der europäischen
@@ -160,19 +154,39 @@ genau wie in der App angezeigt.
 ## `steps.bin` / `steps-initial.bin` (Schritte)
 
 PTM hält seine Datei `Pedometer.dat` offen, sie lässt sich nicht kopieren. Deshalb fragt
-3DS Link PTM selbst (`PTM:GetStepHistory`: *n* Stunden bis zu einer Zeit in ms seit 2000)
-– Tag für Tag ab 1.1.2016, unverändert gespeichert. Welches Ende der Anfrage die Zeit
-meint (und in welcher Reihenfolge die Stunden kommen), ist nicht dokumentiert; darum steht
-bei jeder Anfrage ihre Zeit dabei, und die Auswertung legt es anhand bekannter Tage fest.
+3DS Link PTM selbst (`PTM:GetStepHistory`: *n* Stunden **ab** einer Zeit in ms seit
+1.1.2000, ältester zuerst – an einem echten 3DS mit den Tageswerten der Aktivitätslog-App
+geprüft), Tag für Tag ab 1.1.2011 (Erscheinungsjahr des 3DS). Tage vor der ersten
+Benutzung kommen als 0.
 
 Kopf 16 Bytes: `3DSSTEPS`, u32 Version (1), u32 Größe eines Datensatzes (60). Datensatz:
-u64 Zeit der Anfrage (ms seit 1.1.2000, Ende des Tages), u32 Stunden (24), 24 × u16 Schritte.
+u64 Beginn des Tages (ms seit 1.1.2000, Ortszeit), u32 Stunden (24), 24 × u16 Schritte
+(Stunde 0–23).
 
-## `idb.dat`, `idbt.dat` (Icon-Speicher des HOME-Menüs)
+## `idb.dat` + `idbt.dat` (Namen und Bilder)
 
-Unverändert aus den gemeinsamen Daten des HOME-Menüs (NAND Shared Extdata `F000000B`).
-Darin merkt sich das System Namen und Bilder von Titeln (auch von inzwischen gelöschten);
-die Aktivitätslog-App zeigt daraus die Bilder. Format noch nicht ausgewertet.
+Der Icon-Speicher des HOME-Menüs (NAND Shared Extdata `F000000B`), unverändert kopiert. Er
+enthält jeden Titel, der gestartet wurde – auch längst gelöschte –, und ist die Quelle für
+Namen und Bilder (die Aktivitätslog-App nimmt sie auch von dort). 512 Plätze; Platz *i* in
+`idbt.dat` gehört zu Datensatz *i* in `idb.dat`. Ist er voll, werden Plätze neu belegt –
+darum gibt es auch hier eine `-initial`-Kopie.
+
+`idbt.dat` (8.200 Bytes): u32 unbekannt (vermutlich nächster zu belegender Platz), u32 0,
+dann 512 × 16 Bytes: u64 Title-ID, u32 Zeit (Sekunden seit 2000), u32 unbekannt. Leere
+Plätze: Title-ID 0. Ein Titel kann mehrere Plätze haben – der mit der neuesten Zeit gilt.
+
+`idb.dat` (512 × 0x36A0 Bytes), je Datensatz:
+
+| Offset | Größe | Inhalt |
+|---|---|---|
+| 0x0 | 0x20 | Einstellungen (Altersfreigaben, Region …) wie im SMDH |
+| 0x20 | 16 × 0x200 | Namen je Sprache wie im SMDH: 0x80 kurz, 0x100 lang, 0x80 Hersteller (UTF-16) |
+| 0x2020 | 0x480 | Bild 24×24 |
+| 0x24A0 | 0x1200 | Bild 48×48 |
+
+Bilder: RGB565, in 8×8-Kacheln, die Pixel einer Kachel in Z-Reihenfolge (wie im SMDH).
+Sprachen: 0 Japanisch, 1 Englisch, 2 Französisch, 3 Deutsch, 4 Italienisch, 5 Spanisch, …
+`tools/activity-log/icon_cache.py` macht daraus `titles.csv` und ein PNG pro Titel.
 
 ## Wie das Archiv wächst
 
