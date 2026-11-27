@@ -4560,6 +4560,103 @@ static void archiveSysFiles(void)
     if (newTitle) archiveSysFile(home, 1, "/idb.dat", "idb");
 }
 
+/* names and pictures of titles the HOME Menu's icon cache does not have (homebrew started
+   from another program, e.g. Checkpoint from the Homebrew Launcher, never shows up in it):
+   the title's own icon (SMDH, ExeFS "icon"), stored raw as icons/<title id>.smdh. Looked at:
+   every title in the Activity Log app's library and every title in the archive's entries
+   that are new since the last time (icons/scanned.txt). Titles that are not installed
+   (any more) have none; they are tried again at the next start - a failed open is quick. */
+#define ARC_ICONS ARC_DIR "/icons"
+static bool iconRead(u64 tid, u8* smdh)
+{
+    static const FS_MediaType media[3] = { MEDIATYPE_SD, MEDIATYPE_NAND, MEDIATYPE_GAME_CARD };
+    static const u32 file[5] = { 0, 0, 2, 0x6E6F6369, 0 };   /* ExeFS "icon" */
+    Result last = 0;
+    for (int m = 0; m < 3; m++)
+    {
+        u32 arch[4] = { (u32)tid, (u32)(tid >> 32), media[m], 0 };
+        FS_Path ap = { PATH_BINARY, sizeof(arch), arch };
+        FS_Path fp = { PATH_BINARY, sizeof(file), file };
+        Handle h;
+        Result r = FSUSER_OpenFileDirectly(&h, ARCHIVE_SAVEDATA_AND_CONTENT, ap, fp, FS_OPEN_READ, 0);
+        if (R_FAILED(r)) { last = r; continue; }
+        u32 got = 0;
+        r = FSFILE_Read(h, &got, 0, smdh, 0x36C0);
+        FSFILE_Close(h);
+        if (R_SUCCEEDED(r) && got == 0x36C0 && memcmp(smdh, "SMDH", 4) == 0) return true;
+        last = R_FAILED(r) ? r : (Result)(0xE0000000 | got);
+    }
+    playCheckLog("icon %016llX: none (%08lX)\n", (unsigned long long)tid, (unsigned long)last);
+    return false;
+}
+
+static void archiveIcons(void)
+{
+    static u64 want[1024];
+    int nw = 0;
+#define ICON_WANT(t) do { u64 t_ = (t); u32 hi_ = (u32)(t_ >> 32); \
+        if (hi_ != 0x00040000 && hi_ != 0x00040002) break;   /* games, demos (applets are in the cache) */ \
+        bool have_ = false; \
+        for (int i_ = 0; i_ < nw && !have_; i_++) have_ = want[i_] == t_; \
+        if (!have_ && nw < 1024) want[nw++] = t_; } while (0)
+    /* the Activity Log app's library: 256 x 24 bytes from 0xC3510, title id first */
+    FILE* f = fopen(ARC_DIR "/pld.dat", "rb");
+    if (f)
+    {
+        static u8 lib[256 * 24];
+        if (fseek(f, 0xC3510, SEEK_SET) == 0 && fread(lib, 1, sizeof(lib), f) == sizeof(lib))
+            for (int i = 0; i < 256; i++)
+            {
+                u64 t;
+                memcpy(&t, lib + i * 24, 8);
+                ICON_WANT(t);
+            }
+        fclose(f);
+    }
+    /* entries of the archive not looked at yet */
+    mkdir(ARC_ICONS, 0777);
+    unsigned long long scanned = 0;
+    f = fopen(ARC_ICONS "/scanned.txt", "r");
+    if (f) { if (fscanf(f, "%llu", &scanned) != 1) scanned = 0; fclose(f); }
+    unsigned long long total = scanned;
+    f = fopen(ARC_FILE, "rb");
+    if (f)
+    {
+        fseek(f, 0, SEEK_END);
+        total = (unsigned long long)(ftell(f) - 16) / 12;
+        if (scanned > total) scanned = 0;   /* another archive: all again */
+        fseek(f, 16 + (long)scanned * 12, SEEK_SET);
+        static PlayEntry e[512];
+        size_t n;
+        while ((n = fread(e, sizeof(PlayEntry), 512, f)) > 0)
+            for (size_t i = 0; i < n; i++) ICON_WANT(((u64)e[i].tidHigh << 32) | e[i].tidLow);
+        fclose(f);
+    }
+#undef ICON_WANT
+    /* without the ones in the HOME Menu's icon cache and the ones done before */
+    static u8 idx[8 + 512 * 16];
+    bool haveIdx = false;
+    f = fopen(ARC_DIR "/idbt.dat", "rb");
+    if (f) { haveIdx = fread(idx, 1, sizeof(idx), f) == sizeof(idx); fclose(f); }
+    static u8 smdh[0x36C0];
+    int added = 0, missing = 0;
+    for (int i = 0; i < nw; i++)
+    {
+        bool known = false;
+        for (int s = 0; haveIdx && s < 512 && !known; s++) known = memcmp(idx + 8 + s * 16, &want[i], 8) == 0;
+        if (known) continue;
+        char path[128];
+        snprintf(path, sizeof(path), ARC_ICONS "/%016llX.smdh", (unsigned long long)want[i]);
+        struct stat st;
+        if (stat(path, &st) == 0) continue;
+        if (!iconRead(want[i], smdh)) { missing++; continue; }
+        if (writeIfChanged(path, smdh, sizeof(smdh))) added++;
+    }
+    f = fopen(ARC_ICONS "/scanned.txt", "w");
+    if (f) { fprintf(f, "%llu\n", total); fclose(f); }
+    playCheckLog("icons: %d titles looked at, %d new, %d not installed\n", nw, added, missing);
+}
+
 /* the step counter, hour by hour, as PTM gives it (PTM:GetStepHistory: n hours from a time
    in ms since 2000 on, oldest first - checked on a real 3DS). Its own file (Pedometer.dat)
    is kept open by PTM, so this asks PTM. Stored day by day since 2011 (steps.bin). */
@@ -4711,6 +4808,7 @@ static void archiveThread(void* arg)
     archiveConsole();
     u64 t1 = osGetTime();
     archiveSysFiles();
+    archiveIcons();
     archiveSteps();
     playCheckLog("archive: %d new entries, now %lld, %lu ms; system data and steps %lu ms\n", added,
                  (long long)g_arcCount, (unsigned long)(t1 - t0), (unsigned long)(osGetTime() - t1));

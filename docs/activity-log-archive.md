@@ -18,6 +18,7 @@ liest**. Sie reicht, um ein eigenes Dashboard oder Werkzeug dafür zu bauen.
 | `pld.dat` / `pld-initial.dat` | Daten der Aktivitätslog-App (siehe unten): neuester Stand / der erste je gesicherte, wird nie ersetzt | 3DS Link (bei jedem Start, nur wenn geändert) |
 | `steps.bin` / `steps-initial.bin` | Schritte pro Stunde, vom System erfragt (siehe unten) | 3DS Link (bei jedem Start, nur wenn geändert) |
 | `idb.dat` / `idbt.dat` (+ `-initial`) | Icon-Speicher des HOME-Menüs (Namen, Bilder) | 3DS Link (bei jedem Start, nur wenn geändert) |
+| `icons/<Title-ID>.smdh` | Icon-Datei eines Titels, der im Icon-Speicher fehlt (z. B. Homebrew) | 3DS Link (einmal je Titel) |
 | `console.txt` | von welcher Konsole (Modell, Kennung, Name – den darf man ändern) | 3DS Link (einmal) |
 | `playhistory-pc.bin` | gespielt am PC ohne 3DS (Azahar), gleiches Format | Azahar Link (geplant) |
 
@@ -214,6 +215,20 @@ Plätze: Title-ID 0. Ein Titel kann mehrere Plätze haben – der mit der neuest
 Bilder: RGB565, in 8×8-Kacheln, die Pixel einer Kachel in Z-Reihenfolge (wie im SMDH).
 Sprachen: 0 Japanisch, 1 Englisch, 2 Französisch, 3 Deutsch, 4 Italienisch, 5 Spanisch, …
 `tools/activity-log/icon_cache.py` macht daraus `titles.csv` und ein PNG pro Titel.
+
+## `icons/` (Titel, die das HOME-Menü nicht kennt)
+
+Programme, die nie über das HOME-Menü gestartet wurden (z. B. Homebrew aus dem Homebrew
+Launcher oder FBI heraus), fehlen im Icon-Speicher. Für jeden solchen Titel, der in der
+Bibliothek von `pld.dat` oder in `playhistory.bin` vorkommt, liest 3DS Link die Icon-Datei
+des installierten Titels (ExeFS `icon`, SMDH, 0x36C0 Bytes) und legt sie unverändert als
+`icons/<Title-ID>.smdh` ab (Title-ID 16 Hex-Zeichen). Aufbau wie überall dokumentiert:
+`SMDH`, Namen ab 0x08 (16 Sprachen × 0x200: kurz 0x80, lang 0x100, Herausgeber 0x80,
+UTF-16), 48×48-Icon (RGB565, gekachelt) ab 0x24C0.
+
+Nicht mehr installierte Titel haben keine; sie werden bei jedem Start kurz neu versucht.
+`icons/scanned.txt` merkt sich, bis zu welchem Eintrag von `playhistory.bin` schon geschaut
+wurde. Hat ein Titel beides, gilt der Icon-Speicher.
 
 ## Wie das Archiv wächst
 
