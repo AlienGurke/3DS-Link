@@ -4507,7 +4507,8 @@ static void archiveTitles(void)
     FILE* f = fopen(ARC_DIR "/titles-state.txt", "r");
     if (f)
     {
-        if (fscanf(f, "%lu %llx", &oldTotal, &oldSum) != 2) oldTotal = 0;
+        unsigned long ver = 0;   /* a new version of this looks again at every title */
+        if (fscanf(f, "%lu %lu %llx", &ver, &oldTotal, &oldSum) != 3 || ver != 2) oldTotal = 0;
         fclose(f);
     }
     if (oldTotal == total && oldSum == sum) { amExit(); return; }   /* nothing new installed */
@@ -4527,7 +4528,7 @@ static void archiveTitles(void)
         fclose(f);
     }
     f = fopen(ARC_TITLES, "a");
-    int named = 0, failed = 0;
+    int named = 0, failed = 0, failedOf[3] = { 0, 0, 0 };
     for (int m = 0; f && m < 3; m++)
         for (u32 j = 0; j < read[m]; j++)
         {
@@ -4543,8 +4544,9 @@ static void archiveTitles(void)
             Result why;
             if (!titleName(id, media[m], name, sizeof(name), &why))
             {
-                if (failed++ < 5)
+                if (failedOf[m]++ < 3)
                     playCheckLog("titles: %016llX (media %d): %08lX\n", (unsigned long long)id, m, (unsigned long)why);
+                failed++;
                 continue;
             }
             fprintf(f, "%016llX;%s\n", (unsigned long long)id, name);
@@ -4558,7 +4560,7 @@ static void archiveTitles(void)
        tried again then) */
     if ((f = fopen(ARC_DIR "/titles-state.txt", "w")))
     {
-        fprintf(f, "%lu %llx\n", (unsigned long)total, (unsigned long long)sum);
+        fprintf(f, "2 %lu %llx\n", (unsigned long)total, (unsigned long long)sum);
         fclose(f);
     }
 }
@@ -4568,9 +4570,12 @@ static void archiveTitles(void)
    library) and the step counter (Pedometer.dat in PTM's save). */
 static Result sysSaveRead(u32 saveId, const char* name, u8** out, u32* size)
 {
-    u32 low[2] = { MEDIATYPE_NAND, saveId };
+    /* save ids F00000xx: NAND shared extdata (the HOME Menu's own data), others: system saves */
+    u32 low[3] = { MEDIATYPE_NAND, saveId, 0x00048000 };
+    bool ext = (saveId & 0xFFFFFF00) == 0xF0000000;
     FS_Archive a;
-    Result r = FSUSER_OpenArchive(&a, ARCHIVE_SYSTEM_SAVEDATA, (FS_Path){ PATH_BINARY, sizeof(low), low });
+    Result r = FSUSER_OpenArchive(&a, ext ? ARCHIVE_SHARED_EXTDATA : ARCHIVE_SYSTEM_SAVEDATA,
+                                  (FS_Path){ PATH_BINARY, ext ? 12 : 8, low });
     if (R_FAILED(r)) return r;
     Handle f;
     r = FSUSER_OpenFile(&f, a, fsMakePath(PATH_ASCII, name), FS_OPEN_READ, 0);
@@ -4648,8 +4653,79 @@ static void archiveSysFiles(void)
        JPN, CHN, KOR, TWN) */
     static const u32 pld[6] = { 0x00020222, 0x00020212, 0x00020202, 0x00020262, 0x00020272, 0x00020282 };
     static const u32 ptm[1] = { 0x00010022 };
+    /* the HOME Menu's icon cache (names and pictures of titles it has shown, also ones that
+       are deleted by now): NAND shared extdata F000000B */
+    static const u32 home[1] = { 0xF000000B };
     archiveSysFile(pld, 6, "/pld.dat", "pld");
     archiveSysFile(ptm, 1, "/Pedometer.dat", "Pedometer");
+    archiveSysFile(home, 1, "/idb.dat", "idb");
+    archiveSysFile(home, 1, "/idbt.dat", "idbt");
+}
+
+/* the step counter, hour by hour, as PTM gives it (PTM:GetStepHistory: n hours up to a time
+   in ms since 2000). Its own file (Pedometer.dat) is kept open by PTM, so this asks PTM.
+   Stored raw, day by day since 2016 (steps.bin, see the doc): which end of a request the
+   time means is not documented, so each request is kept with its time. */
+static int archiveSteps(void)
+{
+    Handle h;
+    if (R_FAILED(srvGetServiceHandle(&h, "ptm:u"))) return -1;
+    const u64 day = 86400000ULL;
+    const u64 first = (u64)(daysSince1900(2016, 1, 1) - daysSince1900(2000, 1, 1)) * day;
+    const u64 now = osGetTime() - 3155673600000ULL;
+    if (now < first) { svcCloseHandle(h); playCheckLog("steps: the clock is before 2016\n"); return -1; }
+    const u32 days = (u32)((now - first) / day) + 1;
+    const size_t recSize = 8 + 4 + 48;
+    u8* out = (u8*)malloc(16 + (size_t)days * recSize);
+    if (!out) { svcCloseHandle(h); playCheckLog("steps: no memory\n"); return -1; }
+    memcpy(out, "3DSSTEPS", 8);
+    u32 head[2] = { 1, (u32)recSize };
+    memcpy(out + 8, head, 8);
+    size_t len = 16;
+    Result r = 0;
+    u32 nonzero = 0;
+    for (u32 d = 0; d < days && R_SUCCEEDED(r); d++)
+    {
+        u64 t = first + (u64)(d + 1) * day;   /* the end of that day */
+        u16 v[24];
+        memset(v, 0, sizeof(v));
+        u32* cmd = getThreadCommandBuffer();
+        cmd[0] = IPC_MakeHeader(0xB, 3, 2);
+        cmd[1] = 24;
+        cmd[2] = (u32)t;
+        cmd[3] = (u32)(t >> 32);
+        cmd[4] = IPC_Desc_Buffer(sizeof(v), IPC_BUFFER_W);
+        cmd[5] = (u32)(uintptr_t)v;
+#ifdef LINK_HOST_TEST
+        shim_out_ptr = v;
+#endif
+        r = svcSendSyncRequest(h);
+        if (R_SUCCEEDED(r)) r = (Result)cmd[1];
+        if (R_FAILED(r)) break;
+        memcpy(out + len, &t, 8);
+        u32 n = 24;
+        memcpy(out + len + 8, &n, 4);
+        memcpy(out + len + 12, v, sizeof(v));
+        len += recSize;
+        for (int i = 0; i < 24; i++) nonzero += v[i] != 0;
+    }
+    svcCloseHandle(h);
+    if (R_FAILED(r)) playCheckLog("steps: PTM said %08lX\n", (unsigned long)r);
+    int ret = -1;
+    if (len > 16)
+    {
+        char path[96];
+        snprintf(path, sizeof(path), ARC_DIR "/steps-initial.bin");
+        FILE* f = fopen(path, "rb");
+        if (f) fclose(f);
+        else writeIfChanged(path, out, (u32)len);
+        bool changed = writeIfChanged(ARC_DIR "/steps.bin", out, (u32)len);
+        playCheckLog("steps: %lu days, %lu hours with steps, %s\n", (unsigned long)((len - 16) / recSize),
+                     (unsigned long)nonzero, changed ? "saved" : "unchanged");
+        ret = (int)((len - 16) / recSize);
+    }
+    free(out);
+    return ret;
 }
 
 /* the archive is brought up to date beside the app (it can take a few seconds the first
@@ -4663,6 +4739,7 @@ static void archiveThread(void* arg)
     int added = archiveSync();
     u64 t1 = osGetTime();
     archiveSysFiles();
+    archiveSteps();
     archiveTitles();
     playCheckLog("archive: %d new entries, now %lld, %lu ms; titles %lu ms\n", added, (long long)g_arcCount,
                  (unsigned long)(t1 - t0), (unsigned long)(osGetTime() - t1));

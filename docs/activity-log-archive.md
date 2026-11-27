@@ -17,7 +17,8 @@ liest**. Sie reicht, um ein eigenes Dashboard oder Werkzeug dafür zu bauen.
 | `clock.txt` | Zeitsprünge und Uhr-Korrekturen, mit Eintrags-Nummer | 3DS Link (Uhr-Menü) |
 | `titles.txt` | Title-ID → Spielname | 3DS Link (bei jedem Start, nur neue) |
 | `pld.dat` / `pld-initial.dat` | Daten der Aktivitätslog-App (siehe unten): neuester Stand / der erste je gesicherte, wird nie ersetzt | 3DS Link (bei jedem Start, nur wenn geändert) |
-| `Pedometer.dat` / `Pedometer-initial.dat` | Schrittzähler, unverändert aus dem System | 3DS Link (bei jedem Start, nur wenn geändert) |
+| `steps.bin` / `steps-initial.bin` | Schritte pro Stunde, vom System erfragt (siehe unten) | 3DS Link (bei jedem Start, nur wenn geändert) |
+| `idb.dat` / `idbt.dat` (+ `-initial`) | Icon-Speicher des HOME-Menüs (Namen, Bilder) | 3DS Link (bei jedem Start, nur wenn geändert) |
 | `playhistory-pc.bin` | gespielt am PC ohne 3DS (Azahar), gleiches Format | Azahar Link (geplant) |
 
 Auf der SD-Karte liegen sie in `sdmc:/3ds/3DS-Link/activity/`.
@@ -156,10 +157,22 @@ damit `playhistory.bin` haben keine solche Grenze.
 Geprüft an einem echten Gerät: Pokémon Mond – 263:41, 531-mal, 28.01.2017 bis 17.02.2018,
 genau wie in der App angezeigt.
 
-## `Pedometer.dat`
+## `steps.bin` / `steps-initial.bin` (Schritte)
 
-Unverändert aus dem System-Spielstand von PTM (`00010022`). Format noch nicht ausgewertet
-(laut 3dbrew Einträge aus Zeitstempel und Schrittzahl).
+PTM hält seine Datei `Pedometer.dat` offen, sie lässt sich nicht kopieren. Deshalb fragt
+3DS Link PTM selbst (`PTM:GetStepHistory`: *n* Stunden bis zu einer Zeit in ms seit 2000)
+– Tag für Tag ab 1.1.2016, unverändert gespeichert. Welches Ende der Anfrage die Zeit
+meint (und in welcher Reihenfolge die Stunden kommen), ist nicht dokumentiert; darum steht
+bei jeder Anfrage ihre Zeit dabei, und die Auswertung legt es anhand bekannter Tage fest.
+
+Kopf 16 Bytes: `3DSSTEPS`, u32 Version (1), u32 Größe eines Datensatzes (60). Datensatz:
+u64 Zeit der Anfrage (ms seit 1.1.2000, Ende des Tages), u32 Stunden (24), 24 × u16 Schritte.
+
+## `idb.dat`, `idbt.dat` (Icon-Speicher des HOME-Menüs)
+
+Unverändert aus den gemeinsamen Daten des HOME-Menüs (NAND Shared Extdata `F000000B`).
+Darin merkt sich das System Namen und Bilder von Titeln (auch von inzwischen gelöschten);
+die Aktivitätslog-App zeigt daraus die Bilder. Format noch nicht ausgewertet.
 
 ## Wie das Archiv wächst
 
