@@ -20,9 +20,8 @@ liest**. Sie reicht, um ein eigenes Dashboard oder Werkzeug dafür zu bauen.
 | `idb.dat` / `idbt.dat` (+ `-initial`) | Icon-Speicher des HOME-Menüs (Namen, Bilder) | 3DS Link (bei jedem Start, nur wenn geändert) |
 | `icons/<Title-ID>.smdh` | Icon-Datei eines Titels, der im Icon-Speicher fehlt (z. B. Homebrew) | 3DS Link (einmal je Titel) |
 | `console.txt` | von welcher Konsole (Modell, Kennung, Name – den darf man ändern) | 3DS Link (einmal) |
-| `playhistory-pc.bin` | gespielt am PC ohne 3DS (Azahar), gleiches Format | Azahar Link (geplant) |
 
-Auf der SD-Karte liegen sie in `sdmc:/3ds/3DS-Link/activity/`.
+Auf der SD-Karte liegen sie in `sdmc:/3ds/3DS-Link/activity/`. Die Spielzeit am PC hat einen eigenen Ordner: siehe [pc-activity.md](pc-activity.md).
 
 ## `playhistory.bin`
 
